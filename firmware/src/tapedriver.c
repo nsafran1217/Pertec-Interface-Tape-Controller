@@ -406,6 +406,23 @@ unsigned int TapeRead( uint8_t *Buf, int Buflen, int *BytesRead)
     retStatus |= TSTAT_BLANK;		// say we have a blank tape
 
   *BytesRead = bcount;
+  /* Debug: report block details */
+  DBprintf("TAPE READ: size=%d", bcount);
+  if (bcount > 0)
+    DBprintf(" first=0x%x last=0x%x", (unsigned)Buf[0], (unsigned)Buf[bcount-1]);
+  if (retStatus & TSTAT_TAPEMARK)
+    DBprintf(" TAPEMARK");
+  if (retStatus & TSTAT_BLANK)
+    DBprintf(" BLANK");
+  if (retStatus & TSTAT_EOT)
+    DBprintf(" EOT");
+  if (retStatus & TSTAT_LENGTH)
+    DBprintf(" LENGTH");
+  if (retStatus & TSTAT_HARDERR)
+    DBprintf(" HARDERR");
+  if (retStatus & TSTAT_CORRERR)
+    DBprintf(" SOFTERR");
+  DBprintf("\n");
   return retStatus;			// all done  
 } // TapeRead
 
@@ -558,6 +575,22 @@ unsigned int TapeWrite( uint8_t *Buf, int Buflen)
   if ( status & PS0_ICER)
     retStatus |= TSTAT_CORRERR;		// signal corrected error
   
+  /* Debug: report block write details */
+  DBprintf("TAPE WRITE: size=%d", Buflen);
+  if (Buflen > 0)
+    DBprintf(" first=0x%x last=0x%x", (unsigned)Buf[0], (unsigned)Buf[Buflen-1]);
+  if (retStatus & TSTAT_TAPEMARK)
+    DBprintf(" TAPEMARK");
+  if (retStatus & TSTAT_EOT)
+    DBprintf(" EOT");
+  if (retStatus & TSTAT_LENGTH)
+    DBprintf(" LENGTH");
+  if (retStatus & TSTAT_HARDERR)
+    DBprintf(" HARDERR");
+  if (retStatus & TSTAT_CORRERR)
+    DBprintf(" SOFTERR");
+  DBprintf("\n");
+
 //  Check completion status.
 
   return retStatus;			// done.  
