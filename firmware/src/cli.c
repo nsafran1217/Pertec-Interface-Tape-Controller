@@ -17,6 +17,7 @@
 #include "ymodem.h"
 #include "filesub.h"
 #include "tapeutil.h"
+#include "tapedriver.h"
 
 #define MAX_ARGS 5		// maximum number of arguments to command
 
@@ -66,6 +67,8 @@ static const COMMAND_LIST Commands[] =
  { "STOP",	
    "Set stop: # of filemarks or V for EOV ", 	CmdSetStop	},  // tapeutil
  { "DEBUG",	"Set command register [value]",	CmdTapeDebug	},  // tapeutil
+ { "ASSERTIGO", "Assert IGO (hold IGO state)",	CmdAssertIGO },
+ { "ASSERTIWFM", "Assert IGO + write filemark (hold state)", CmdAssertIWFM },
 
 // { "SETPE",	"Set 1600 PE mode",		CmdSet1600	},  // tapeutil
 // { "SETGCR",	"Set 6250 GCR mode",		CmdSet6250	},  // tapeutil

@@ -35,4 +35,8 @@ bool IsTapeProtected( void);
 uint16_t TapeStatus( void);
 void IssueTapeCommand( uint16_t What);
 
+// CLI command handlers
+void CmdAssertIGO( char *args[]);
+void CmdAssertIWFM( char *args[]);
+
 #endif

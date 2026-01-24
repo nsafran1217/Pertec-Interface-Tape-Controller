@@ -410,17 +410,15 @@ unsigned int TapeRead( uint8_t *Buf, int Buflen, int *BytesRead)
   DBprintf("TAPE READ: size=%d", bcount);
   if (bcount > 0)
     DBprintf(" first=0x%x last=0x%x", (unsigned)Buf[0], (unsigned)Buf[bcount-1]);
-  if (retStatus & TSTAT_TAPEMARK)
+  if (status & PS0_IFMK)
     DBprintf(" TAPEMARK");
-  if (retStatus & TSTAT_BLANK)
-    DBprintf(" BLANK");
-  if (retStatus & TSTAT_EOT)
+  if (status & PS1_EOT)
     DBprintf(" EOT");
-  if (retStatus & TSTAT_LENGTH)
+  if (status & PS0_WREMPTY)
     DBprintf(" LENGTH");
-  if (retStatus & TSTAT_HARDERR)
+  if (status & PS0_IHER)
     DBprintf(" HARDERR");
-  if (retStatus & TSTAT_CORRERR)
+  if (status & PS0_ICER)
     DBprintf(" SOFTERR");
   DBprintf("\n");
   return retStatus;			// all done  
@@ -496,7 +494,11 @@ unsigned int TapeWrite( uint8_t *Buf, int Buflen)
   {
     status = TapeStatus();		// grab current status
   } while( !(status & PS1_IFBY));   	// wait for formatter finished
-
+  
+  if (status & PS0_IHER)
+    DBprintf(" HARDERR");
+  if (status & PS0_ICER)
+    DBprintf(" SOFTERR");
 //  If writing a filemark, there's no data phase.
 //  If writing data, prime the buffer.
 
@@ -570,24 +572,28 @@ unsigned int TapeWrite( uint8_t *Buf, int Buflen)
     status = TapeStatus();		// grab current status
   } while( (status & PS1_IFBY));   	// wait for formatter finished
 
-  if ( status & PS0_IHER)
+  if ( status & PS0_IHER) {
     retStatus |= TSTAT_HARDERR;		// signal hard error
-  if ( status & PS0_ICER)
+    DBprintf("  HARD ERROR detected\n");
+  }
+  if ( status & PS0_ICER){
     retStatus |= TSTAT_CORRERR;		// signal corrected error
+    DBprintf("  CORRECTED ERROR detected\n");
+  }
   
   /* Debug: report block write details */
-  DBprintf("TAPE WRITE: size=%d", Buflen);
+  DBprintf("%x TAPE WRITE: size=%d", status, Buflen);
   if (Buflen > 0)
     DBprintf(" first=0x%x last=0x%x", (unsigned)Buf[0], (unsigned)Buf[Buflen-1]);
-  if (retStatus & TSTAT_TAPEMARK)
+  if (status & PS0_IFMK)
     DBprintf(" TAPEMARK");
-  if (retStatus & TSTAT_EOT)
+  if (status & PS1_EOT)
     DBprintf(" EOT");
-  if (retStatus & TSTAT_LENGTH)
+  if (status & PS0_WREMPTY)
     DBprintf(" LENGTH");
-  if (retStatus & TSTAT_HARDERR)
+  if (status & PS0_IHER)
     DBprintf(" HARDERR");
-  if (retStatus & TSTAT_CORRERR)
+  if (status & PS0_ICER)
     DBprintf(" SOFTERR");
   DBprintf("\n");
 
@@ -595,6 +601,26 @@ unsigned int TapeWrite( uint8_t *Buf, int Buflen)
 
   return retStatus;			// done.  
 } // TapeWrite
+
+// CmdAssertIGO - Assert the IGO bit and leave it set
+// -----------------------------------------------
+void CmdAssertIGO( char *args[])
+{
+  (void) args;
+  IssueTapeCommand( PC_IGO );
+  DBprintf("Asserted PC_IGO\n");
+}
+
+// CmdAssertIWFM - Assert IGO + write filemark and leave it set
+// -----------------------------------------------------------
+void CmdAssertIWFM( char *args[])
+{
+  uint16_t driveCmd;
+  (void) args;
+  driveCmd = PC_IWRT | PC_IWFM;    // write file mark
+  IssueTapeCommand( PC_IGO | driveCmd );
+  DBprintf("Asserted PC_IGO + IWFM\n");
+}
 
 //*	Status Testing Routines.
 //	========================
