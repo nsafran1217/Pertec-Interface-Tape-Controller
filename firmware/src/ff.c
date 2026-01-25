@@ -1060,6 +1060,7 @@ static FRESULT sync_window (	/* Returns FR_OK or FR_DISK_ERR */
 
 
 	if (fs->wflag) {	/* Is the disk access window dirty? */
+//		 DBprintf("SYNC_WINDOW: sector=%d\n", fs->winsect);  // ADD THIS
 		if (disk_write(fs->pdrv, fs->win, fs->winsect, 1) == RES_OK) {	/* Write it back into the volume */
 			fs->wflag = 0;	/* Clear window dirty flag */
 			if (fs->winsect - fs->fatbase < fs->fsize) {	/* Is it in the 1st FAT? */
@@ -1245,7 +1246,7 @@ static FRESULT put_fat (	/* FR_OK(0):succeeded, !=0:error */
 	UINT bc;
 	BYTE *p;
 	FRESULT res = FR_INT_ERR;
-
+//	DBprintf("PUT_FAT: clst=%d val=%d\n", clst, val);  // debug
 
 	if (clst >= 2 && clst < fs->n_fatent) {	/* Check if in valid range */
 		switch (fs->fs_type) {
@@ -1529,6 +1530,7 @@ static DWORD create_chain (	/* 0:No free cluster, 1:Internal error, 0xFFFFFFFF:D
 	DWORD cs, ncl, scl;
 	FRESULT res;
 	FATFS *fs = obj->fs;
+//	DBprintf("CREATE_CHAIN: clst=%d\n", clst);  // ADD THIS
 
 
 	if (clst == 0) {	/* Create a new chain */
@@ -4044,6 +4046,7 @@ FRESULT f_write (
 					clst = fp->obj.sclust;	/* Follow from the origin */
 					if (clst == 0) {		/* If no cluster is allocated, */
 						clst = create_chain(&fp->obj, 0);	/* create a new cluster chain */
+	//					DBprintf("F_WRITE: new chain clst=%d\n", clst);  // ADD THIS
 					}
 				} else {					/* On the middle or end of the file */
 #if FF_USE_FASTSEEK

@@ -505,121 +505,121 @@ void CmdTapeDebug( char *args[])
 
 void CmdCreateImage( char *args[])
 {
+  FRESULT fres;
+  FIL tf;
+  bool noRewind, abort;
+  int fileCount, tapeMarkSeen;
+  uint32_t tapeHeader;
+  UINT wc;
+  
+  uint32_t readStart, readEnd, writeStart, writeEnd; // debug
 
-  FRESULT
-    fres;               // file result codes
+  int curBuf = 0;  // current buffer index for double buffering
+  uint8_t *halfBuf[2];
+  halfBuf[0] = TapeBuffer;
+  halfBuf[1] = TapeBuffer + (TAPE_BUFFER_SIZE / 2);
 
-  FIL 
-    tf;                 // our file structure
-
-  bool
-    noRewind,		// if true, skip rewinding
-    abort;              // flag that we have to stop 
-
-  int
-    fileCount,          // how many files?
-    tapeMarkSeen;       // how many tape marks in a row?
-
-  uint32_t
-    tapeHeader;		// record header/trailer    
-
-  UINT 
-    wc;                 // write count (returned)
+  // Previous block state (for deferred SD write)
+  int prevCount = 0;
+  uint32_t prevHeader = 0;
+  bool havePrevious = false;
 
   if ( !args[0])
   {
     Uprintf( "This command requires an image file name!\n");
     return;
-  } // if no arguments
+  }
   
-  noRewind = false;			// rewind assumed
+  noRewind = false;
   if ( args[1])
   {
     if ( toupper( *args[1]) == 'N')
-      noRewind = true;			// don't rewind before or after
-  } // see if no rewinding
+      noRewind = true;
+  }
   
-//  Rewind the tape if necessary.  If offline, quit.
-
   if ( !IsTapeOnline())
   {
     Uprintf( "\nTape is offline.\n");
     return;
-  } // tape isn't online
+  }
     
   if ( !noRewind)
     TapeRewind();
-
-// Note that if not rewinding, our block count is relative to the last
-// known position of the tape.
-
-//  Open the file for writing.
 
   if ( (fres = f_open( &tf, args[0], FA_CREATE_ALWAYS | FA_WRITE)) != FR_OK)
   {
     Uprintf( "\nError in creating file. Error = %d\n", fres);
     return;
-  } // if open error         
-
-//  Now copy things.
+  }
 
   LastRecordCount = 0;
-  TapePosition = 0;              // block counter
+  TapePosition = 0;
   tapeMarkSeen = 0;
   BytesCopied = 0;
   fileCount = 0;
   abort = false;
 
   ShowRTCTime();
-
-  while( true)
-  { // read until done or abort
   
-    unsigned int
-      readStat;			// status
-    int
-      readCount;		// count of bytes read
+  while( true)
+  {
+    unsigned int readStat;
+    int readCount;
      
-    if ( (abort = CheckForEscape()) )  // Check for ESC key
+    if ( (abort = CheckForEscape()) )
       break;
 
-//      Read forward.
+    // Read forward into current buffer
+    readStart = Milliseconds;
+    readStat = TapeRead( halfBuf[curBuf], TAPE_BUFFER_SIZE / 2, &readCount);
+    readEnd = Milliseconds;
 
-    readStat = TapeRead( TapeBuffer, TAPE_BUFFER_SIZE, &readCount);
-    tapeHeader = readCount;	// save the record count
+    // Write previous block while we just finished reading current
+    writeStart = Milliseconds;
+    if (havePrevious)
+    {
+      f_write(&tf, &prevHeader, sizeof(prevHeader), &wc);
+      if (prevCount > 0)
+      {
+        f_write(&tf, halfBuf[1 - curBuf], prevCount, &wc);
+        f_write(&tf, &prevHeader, sizeof(prevHeader), &wc);
+      }
+      AddRecordCount(prevCount);
+    }
+    writeEnd = Milliseconds;
 
-//	Have a look at the returned status.
+    DBprintf("Block %d: Read=%dms (%d bytes, buf%d), Write=%dms (%d bytes, buf%d)\n",
+             TapePosition, 
+             readEnd - readStart, readCount, curBuf,
+             writeEnd - writeStart, havePrevious ? prevCount : 0, 1 - curBuf);
 
-    if ( StopAfterError && 
-      (readStat & TSTAT_HARDERR))
+    tapeHeader = readCount;
+
+    if ( StopAfterError && (readStat & TSTAT_HARDERR))
     {
       Uprintf( "Stopping at error or blank.\n");
       break;
     }
 
     if ( (readStat & TSTAT_BLANK) || (readStat & TSTAT_EOT))
-    { // hit a blank; quit
+    {
       Uprintf( "Blank/Erased tape or EOT hit\n");
       break;
     }
 
-//	Check for tapemark.	
-
-    if ( readStat & TSTAT_TAPEMARK)
+    if (readStat & TSTAT_TAPEMARK)
     {
       tapeMarkSeen++;
       fileCount++;
       readCount = 0;
     }
     else
-      tapeMarkSeen = 0;		// not a tapemark, start all over
-     
-//  Simply note corrected errors     
-     
-     if ( readStat & TSTAT_CORRERR)
-       Uprintf( "At block %d, an error was auto-corrected.\n", TapePosition); 
-      
-//  Also note length error; set error flag.
+    {
+      tapeMarkSeen = 0;
+    }
+
+    if ( readStat & TSTAT_CORRERR)
+      Uprintf( "At block %d, an error was auto-corrected.\n", TapePosition); 
 
     if( readStat & TSTAT_LENGTH)
     {
@@ -633,47 +633,64 @@ void CmdCreateImage( char *args[])
       tapeHeader |= TAP_ERROR_FLAG;
     }
     TapePosition++;
-    
-//  Finally, it's time to write out a record.
 
-    f_write( &tf, &tapeHeader, sizeof( tapeHeader), &wc);          
-
-//  If it's a filemark or other 0-length error, don't write the trailer.
-
-    if ( readCount)
+    if (StopTapemarks == 'V')
     {
-      f_write( &tf, TapeBuffer, readCount, &wc);
-      f_write( &tf, &tapeHeader, sizeof( tapeHeader), &wc);          
-    }
-    AddRecordCount( readCount);
-
-    if ( StopTapemarks == 'V')
-    { // if stopping on EOV - ASCII or EBCDIC
+      const uint8_t stopASCII[3] = { 'E', 'O', 'V'};
+      const uint8_t stopEBCDIC[3] = { 0xc5, 0xd6, 0xe5 };
     
-      const uint8_t
-        stopASCII[3] = { 'E', 'O', 'V'},
-        stopEBCDIC[3] = { 0xc5, 0xd6, 0xe5 };
-    
-      if ( !memcmp( TapeBuffer, stopASCII, 3) ||
-           !memcmp( TapeBuffer, stopEBCDIC, 3) )
-      { // we see EOV 
-        Uprintf( "Hit EOV--ending\n");
+      if (!memcmp(halfBuf[curBuf], stopASCII, 3) ||
+          !memcmp(halfBuf[curBuf], stopEBCDIC, 3))
+      {
+        Uprintf("Hit EOV--ending\n");
+        prevHeader = tapeHeader;
+        prevCount = readCount;
+        havePrevious = true;
+        curBuf = 1 - curBuf;  
         break;
-      }	// EOV check
-    } // check for EOV stop
+      }
+    }
 
-    if ( tapeMarkSeen == StopTapemarks)  
+    if (tapeMarkSeen == StopTapemarks)  
     {
-      fileCount -= (StopTapemarks -1);
-      Uprintf( "%d consecutive tape marks--ending.\n", StopTapemarks);
+      fileCount -= (StopTapemarks - 1);
+      Uprintf("%d consecutive tape marks--ending.\n", StopTapemarks);
+      prevHeader = tapeHeader;
+      prevCount = readCount;
+      havePrevious = true;
+      curBuf = 1 - curBuf;
       break;
-    } // if tapemark hit
+    }
+
+    prevHeader = tapeHeader;
+    prevCount = readCount;
+    havePrevious = true;
+
+    // Swap buffers
+    curBuf = 1 - curBuf;  
+
   } // read the tape
   
-// Write an EOM record, rewind and close.
+  // Write out final block
+  DBprintf("Final block: writing %d bytes from buf%d\n", prevCount, 1 - curBuf);
+  writeStart = Milliseconds;
+  if (havePrevious)
+  {
+    f_write(&tf, &prevHeader, sizeof(prevHeader), &wc);
+    if (prevCount > 0)
+    {
+      f_write(&tf, halfBuf[1 - curBuf], prevCount, &wc);
+      f_write(&tf, &prevHeader, sizeof(prevHeader), &wc);
+    }
+    AddRecordCount(prevCount);
+  }
+  writeEnd = Milliseconds;
+  DBprintf("Final write: %dms\n", writeEnd - writeStart);
 
+  // Write EOM record
   tapeHeader = TAP_EOM;
   f_write( &tf, &tapeHeader, sizeof( tapeHeader), &wc);          
+
   if ( abort)
   {
     Uprintf( "Operation terminated by operator.\n");
@@ -685,13 +702,13 @@ void CmdCreateImage( char *args[])
   Uprintf( "\n%d blocks read.\n", TapePosition);
   Uprintf( "%d files; %d bytes copied.\n", fileCount, BytesCopied);
   if (!abort)
-    GetComment( args[0]);		// get a comment
+    GetComment( args[0]);
   if ( !noRewind)
   {
     Uprintf( "Rewinding...\n");
     TapeRewind();
-    TapePosition = 0;		// we rewound the tape
-  } // rewind if requested
+    TapePosition = 0;
+  }
   ShowRTCTime();
   return;
 } // CmdCreateImage

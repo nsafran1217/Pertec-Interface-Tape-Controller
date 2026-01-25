@@ -154,6 +154,7 @@ static const struct usb_endpoint_descriptor data_endp[] =
   }
 };
 
+#ifndef DISABLE_USB_MSC
 static const struct usb_endpoint_descriptor msc_endp[] = 
 {
   {
@@ -173,6 +174,7 @@ static const struct usb_endpoint_descriptor msc_endp[] =
     .bInterval = 1,
   }
 };
+#endif
 
 static const struct usb_interface_descriptor comm_iface[] = 
 {
@@ -211,6 +213,7 @@ static const struct usb_interface_descriptor data_iface[] =
   }
 };
 
+#ifndef DISABLE_USB_MSC
 static const struct usb_interface_descriptor msc_iface[] = 
 {
   {
@@ -227,7 +230,9 @@ static const struct usb_interface_descriptor msc_iface[] =
     .endpoint = msc_endp,
   }
 };
+#endif
 
+#ifndef DISABLE_USB_MSC
 static const struct usb_interface ifaces[] = 
 {
   {
@@ -243,13 +248,30 @@ static const struct usb_interface ifaces[] =
     .altsetting = msc_iface,
   },
 };
+#else
+static const struct usb_interface ifaces[] = 
+{
+  {
+    .num_altsetting = 1,
+    .altsetting = comm_iface,
+  },
+  {
+    .num_altsetting = 1,
+    .altsetting = data_iface,
+  },
+};
+#endif
 
 static const struct usb_config_descriptor config_descr = 
 {
   .bLength = USB_DT_CONFIGURATION_SIZE,
   .bDescriptorType = USB_DT_CONFIGURATION,
   .wTotalLength = 0,
+#ifdef DISABLE_USB_MSC
+  .bNumInterfaces = 2,
+#else
   .bNumInterfaces = 3,
+#endif
   .bConfigurationValue = 1,
   .iConfiguration = 0,
   .bmAttributes = 0x80,
@@ -464,6 +486,7 @@ int USInit(void)
     DBprintf( "SD init returns\n");
   }
 
+#ifndef DISABLE_USB_MSC
   usb_msc_init(usb_device,
                USB_MSC_ENDPOINT_IN,
                USB_PACKET_SIZE,
@@ -475,6 +498,9 @@ int USInit(void)
                get_block_count(),
                read_block,
                write_block);
+#else
+  DBprintf("USB MSC disabled at compile time\n");
+#endif
 
 
   return 0;               

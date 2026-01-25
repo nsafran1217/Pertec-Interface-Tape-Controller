@@ -128,7 +128,7 @@ DRESULT  disk_write (BYTE pdrv, const BYTE *buff, LBA_t sector, UINT count)
 //	performed.
 
 
-  SD_WaitComplete();
+  //SD_WaitComplete();
   if ( IS_MISALIGNED( buff))
   {
     while( count--)
@@ -144,7 +144,8 @@ DRESULT  disk_write (BYTE pdrv, const BYTE *buff, LBA_t sector, UINT count)
   else
   {  // aligned buffers, no problem
     sdstat = SD_WriteBlocks( (void *) buff, sector, count);
-    SD_WaitComplete();
+    //SD_WaitComplete();  //REmove WAIT for async operation.
+    //DBprintf("aligned");
   } // aligned buffers
   
   if (sdstat != SD_ERR_SUCCESS)

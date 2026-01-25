@@ -693,7 +693,7 @@ static void SD_BeginTransfer(void *Buf, uint32_t Count, DMA_DIRECTION Dir)
 
 SD_ERROR SD_WaitComplete( void)
 {
-
+  DBprintf("WAIT");
   if ( TransferPending == XFER_INACTIVE)
     return SD_ERR_SUCCESS;		// if nothing happening just quti
 
