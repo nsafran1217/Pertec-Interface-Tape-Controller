@@ -519,6 +519,9 @@ void CmdCreateImage( char *args[])
   halfBuf[0] = TapeBuffer;
   halfBuf[1] = TapeBuffer + (TAPE_BUFFER_SIZE / 2);
 
+  /* Temporary buffer to assemble header + data + trailer for single f_write */
+  uint8_t writeBuf[(TAPE_BUFFER_SIZE / 2) + (sizeof(uint32_t) * 2)];
+
   // Previous block state (for deferred SD write)
   int prevCount = 0;
   uint32_t prevHeader = 0;
@@ -574,16 +577,19 @@ void CmdCreateImage( char *args[])
     readStat = TapeRead( halfBuf[curBuf], TAPE_BUFFER_SIZE / 2, &readCount);
     readEnd = Milliseconds;
 
-    // Write previous block while we just finished reading current
+    // Write previous block while we just finished reading current (single SD write)
     writeStart = Milliseconds;
     if (havePrevious)
     {
-      f_write(&tf, &prevHeader, sizeof(prevHeader), &wc);
+      size_t writeSize = sizeof(prevHeader);
+      memcpy(writeBuf, &prevHeader, sizeof(prevHeader));
       if (prevCount > 0)
       {
-        f_write(&tf, halfBuf[1 - curBuf], prevCount, &wc);
-        f_write(&tf, &prevHeader, sizeof(prevHeader), &wc);
+        writeSize += prevCount + sizeof(prevHeader);
+        memcpy(writeBuf + sizeof(prevHeader), halfBuf[1 - curBuf], prevCount);
+        memcpy(writeBuf + sizeof(prevHeader) + prevCount, &prevHeader, sizeof(prevHeader));
       }
+      f_write(&tf, writeBuf, writeSize, &wc);
       AddRecordCount(prevCount);
     }
     writeEnd = Milliseconds;
@@ -676,12 +682,12 @@ void CmdCreateImage( char *args[])
   writeStart = Milliseconds;
   if (havePrevious)
   {
-    f_write(&tf, &prevHeader, sizeof(prevHeader), &wc);
+    size_t writeSize = sizeof(prevHeader) + prevCount + sizeof(prevHeader);
+    memcpy(writeBuf, &prevHeader, sizeof(prevHeader));
     if (prevCount > 0)
-    {
-      f_write(&tf, halfBuf[1 - curBuf], prevCount, &wc);
-      f_write(&tf, &prevHeader, sizeof(prevHeader), &wc);
-    }
+      memcpy(writeBuf + sizeof(prevHeader), halfBuf[1 - curBuf], prevCount);
+    memcpy(writeBuf + sizeof(prevHeader) + prevCount, &prevHeader, sizeof(prevHeader));
+    f_write(&tf, writeBuf, writeSize, &wc);
     AddRecordCount(prevCount);
   }
   writeEnd = Milliseconds;
