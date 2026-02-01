@@ -416,6 +416,7 @@ static void handle_read_block(uint16_t seq) {
                 continue;
             }
             rb_write(&tx_ring, &TapeBuffer[sent], chunk);
+            DBprintf("stat=%d bytes=%d buffer[0]=%d\n", stat, bytesRead, TapeBuffer[0]);
             sent += chunk;
             usb_tx_flush_all();
         }

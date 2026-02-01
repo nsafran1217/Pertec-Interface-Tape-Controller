@@ -156,7 +156,7 @@ uint16_t TapeUtil_ReadBlock(uint8_t *buffer, uint16_t max_len,
         return TSTAT_OFFLINE;
     
     stat = TapeRead(buffer, max_len, &count);
-    
+    DBprintf("stat=%d bytes=%d buffer[0]=%d\n", stat, bytes_read, buffer[0]);
     if (bytes_read)
         *bytes_read = count;
     
