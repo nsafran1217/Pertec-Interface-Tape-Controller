@@ -46,6 +46,8 @@ enum usb_cmd {
     CMD_WRITE_START     = 0x43,
     CMD_WRITE_NEXT      = 0x44,
     CMD_WRITE_STOP      = 0x45,
+
+    CMD_DEBUG_INFO      = 0xF0
 };
 
 /* Response codes */

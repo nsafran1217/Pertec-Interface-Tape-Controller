@@ -21,8 +21,12 @@
 #define PROTOCOL_VER 1
 
 /* Ring buffer sizes (must be power of 2) */
-#define RX_BUF_SIZE 8192
-#define TX_BUF_SIZE 8192
+#define RX_BUF_SIZE  4096
+#define TX_BUF_SIZE  4096
+
+/* Maximum bytes we can send in one read response */
+/* Header(8) + ReadHdr(5) + Data must fit in TX buffer with margin */
+#define MAX_READ_CHUNK  (TX_BUF_SIZE - 64)
 
 /* Ring buffer */
 typedef struct {
@@ -201,8 +205,10 @@ static uint8_t rb_get(ringbuf_t *rb) {
     rb->tail = (rb->tail + 1) & (rb->size - 1);
     return c;
 }
-static void rb_write(ringbuf_t *rb, const uint8_t *data, uint16_t len) {
+static bool rb_write(ringbuf_t *rb, const uint8_t *data, uint16_t len) {
+    if (rb_free(rb) < len) return false;  /* Not enough space */
     while (len--) rb_put(rb, *data++);
+    return true;
 }
 static void rb_read(ringbuf_t *rb, uint8_t *data, uint16_t len) {
     while (len--) *data++ = rb_get(rb);
@@ -221,14 +227,49 @@ uint16_t USB_CRC16(const uint8_t *data, uint16_t len) {
     return crc;
 }
 
-/* Send response */
+/* Flush TX buffer to USB - blocks until done */
+static void usb_tx_flush_all(void) {
+    uint8_t buf[64];
+    while (rb_used(&tx_ring) > 0) {
+        uint16_t len = rb_used(&tx_ring);
+        if (len > 64) len = 64;
+        rb_read(&tx_ring, buf, len);
+        while (usbd_ep_write_packet(usb_dev, 0x82, buf, len) == 0)
+            usbd_poll(usb_dev);
+    }
+}
+
+/* Send response - handles large payloads by flushing as needed */
 static void send_response(uint8_t status, uint16_t seq, const void *data, uint16_t len) {
     usb_resp_hdr_t hdr = { .sync = RESP_SYNC_BYTE, .status = status, .seq = seq, .len = len };
     uint16_t crc = USB_CRC16((uint8_t*)&hdr, 6);
     if (len && data) crc ^= USB_CRC16(data, len);
     hdr.crc = crc;
+    
+    /* Flush any pending data first */
+    usb_tx_flush_all();
+    
+    /* Write header */
     rb_write(&tx_ring, (uint8_t*)&hdr, sizeof(hdr));
-    if (len && data) rb_write(&tx_ring, data, len);
+    
+    /* Write payload in chunks, flushing as needed */
+    if (len && data) {
+        const uint8_t *p = (const uint8_t *)data;
+        while (len > 0) {
+            uint16_t chunk = rb_free(&tx_ring);
+            if (chunk > len) chunk = len;
+            if (chunk == 0) {
+                usb_tx_flush_all();
+                continue;
+            }
+            rb_write(&tx_ring, p, chunk);
+            p += chunk;
+            len -= chunk;
+        }
+    }
+    
+    /* Flush everything */
+    usb_tx_flush_all();
 }
 
 /* Translate tape status to response code */
@@ -328,22 +369,57 @@ static void handle_read_block(uint16_t seq) {
     uint8_t flags = 0;
     uint16_t stat = TapeUtil_ReadBlock(TapeBuffer, TAPE_BUFFER_SIZE, &bytesRead, &flags);
     
-    usb_read_hdr_t hdr = { .length = bytesRead, .flags = flags };
+    usb_read_hdr_t hdr = { .length = (uint32_t)bytesRead, .flags = flags };
     
-    /* Build response with header + data */
+    /* Determine response status */
     uint8_t resp_status = translate_status(stat);
     if (bytesRead > 0) resp_status = RESP_DATA;
     
+    /* Build combined payload: read_hdr + data */
     uint16_t total_len = sizeof(hdr) + bytesRead;
-    usb_resp_hdr_t resp = { .sync = RESP_SYNC_BYTE, .status = resp_status, .seq = seq, .len = total_len };
+    
+    /* Compute CRC over: resp_header(6 bytes, excluding crc field) + read_hdr + data */
+    usb_resp_hdr_t resp = { 
+        .sync = RESP_SYNC_BYTE, 
+        .status = resp_status, 
+        .seq = seq, 
+        .len = total_len,
+        .crc = 0 
+    };
+    
     uint16_t crc = USB_CRC16((uint8_t*)&resp, 6);
     crc ^= USB_CRC16((uint8_t*)&hdr, sizeof(hdr));
-    if (bytesRead) crc ^= USB_CRC16(TapeBuffer, bytesRead);
+    if (bytesRead > 0) {
+        crc ^= USB_CRC16(TapeBuffer, bytesRead);
+    }
     resp.crc = crc;
     
+    /* Flush any pending data */
+    usb_tx_flush_all();
+    
+    /* Send response header */
     rb_write(&tx_ring, (uint8_t*)&resp, sizeof(resp));
+    usb_tx_flush_all();
+    
+    /* Send read header */
     rb_write(&tx_ring, (uint8_t*)&hdr, sizeof(hdr));
-    if (bytesRead) rb_write(&tx_ring, TapeBuffer, bytesRead);
+    usb_tx_flush_all();
+    
+    /* Send data in chunks */
+    if (bytesRead > 0) {
+        int sent = 0;
+        while (sent < bytesRead) {
+            uint16_t chunk = rb_free(&tx_ring);
+            if (chunk > (bytesRead - sent)) chunk = bytesRead - sent;
+            if (chunk == 0) {
+                usb_tx_flush_all();
+                continue;
+            }
+            rb_write(&tx_ring, &TapeBuffer[sent], chunk);
+            sent += chunk;
+            usb_tx_flush_all();
+        }
+    }
 }
 
 static void handle_write_block(uint16_t seq, const uint8_t *data, uint16_t len) {
@@ -354,6 +430,34 @@ static void handle_write_block(uint16_t seq, const uint8_t *data, uint16_t len) 
 static void handle_write_filemark(uint16_t seq) {
     uint16_t stat = TapeUtil_WriteFilemark();
     send_response(translate_status(stat), seq, NULL, 0);
+}
+
+/* Debug info structure */
+typedef struct __attribute__((packed)) {
+    uint16_t tape_buffer_size;
+    uint16_t usb_max_payload;
+    uint16_t tx_buf_size;
+    uint16_t rx_buf_size;
+    uint16_t tx_used;
+    uint16_t rx_used;
+    uint32_t position;
+    uint32_t bytes_transferred;
+    uint32_t errors;
+} debug_info_t;
+
+static void handle_debug_info(uint16_t seq) {
+    debug_info_t info = {
+        .tape_buffer_size = TAPE_BUFFER_SIZE,
+        .usb_max_payload = USB_MAX_PAYLOAD,
+        .tx_buf_size = TX_BUF_SIZE,
+        .rx_buf_size = RX_BUF_SIZE,
+        .tx_used = rb_used(&tx_ring),
+        .rx_used = rb_used(&rx_ring),
+        .position = TapeUtil_GetPosition(),
+        .bytes_transferred = TapeUtil_GetBytesTransferred(),
+        .errors = TapeUtil_GetErrorCount()
+    };
+    send_response(RESP_OK, seq, &info, sizeof(info));
 }
 
 /* Process a complete command */
@@ -376,6 +480,9 @@ static void process_command(void) {
         case CMD_RESET:
             TapeUtil_ResetCounters();
             send_response(RESP_OK, seq, NULL, 0);
+            break;
+        case CMD_DEBUG_INFO:
+            handle_debug_info(seq);
             break;
         default:
             send_response(RESP_ERR_CMD, seq, NULL, 0);
@@ -434,14 +541,13 @@ bool USB_IsConnected(void) {
 void USB_Poll(void) {
     usbd_poll(usb_dev);
     
-    /* Transmit pending data */
-    uint8_t buf[64];
-    uint16_t len = rb_used(&tx_ring);
-    if (len > 64) len = 64;
-    if (len > 0) {
+    /* Transmit any pending data */
+    if (rb_used(&tx_ring) > 0) {
+        uint8_t buf[64];
+        uint16_t len = rb_used(&tx_ring);
+        if (len > 64) len = 64;
         rb_read(&tx_ring, buf, len);
-        while (usbd_ep_write_packet(usb_dev, 0x82, buf, len) == 0)
-            usbd_poll(usb_dev);
+        usbd_ep_write_packet(usb_dev, 0x82, buf, len);
     }
 }
 

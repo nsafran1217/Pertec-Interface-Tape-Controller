@@ -41,7 +41,7 @@ enum cmd_code {
     CMD_PULSE           = 0x42,  /* Generate timed pulse */
     
     /* Debug */
-    CMD_DEBUG_LOG       = 0xF0,  /* Enable/disable debug logging */
+    CMD_DEBUG_INFO      = 0xF0,  /* Enable/disable debug logging */
     CMD_RAW_ACCESS      = 0xF1,  /* Raw register access */
 };
 
