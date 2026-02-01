@@ -428,6 +428,15 @@ static enum usbd_request_return_codes cdcacm_control_request(
   switch (req->bRequest) 
   {
     case USB_CDC_REQ_SET_CONTROL_LINE_STATE: 
+      // wIndex contains the interface number; wValue bit0 is DTR
+      if (req->wIndex == CDC1_CTRL_IF)
+      {
+        usb_is_connected = (req->wValue & 1) ? true : false;
+      }
+      else if (req->wIndex == CDC2_CTRL_IF)
+      {
+        usb_is_connected2 = (req->wValue & 1) ? true : false;
+      }
       return USBD_REQ_HANDLED;
 
     case USB_CDC_REQ_GET_LINE_CODING:
@@ -499,7 +508,6 @@ static void usb_cdc_set_config_callback(usbd_device *usbd_dev, uint16_t wValue) 
   if (!usb_is_connected) 
   {
     usb_is_connected = true;
-    usb_is_connected2 = true;
   }
 
   usbd_ep_setup(usbd_dev, USB_DATA_ENDPOINT_OUT, USB_ENDPOINT_ATTR_BULK, USB_PACKET_SIZE, cdcacm_data_rx_cb);
@@ -522,7 +530,11 @@ static void usb_suspend_callback()
 // We are being suspended, disconnect.
   if (usb_is_connected) 
   {
-        usb_is_connected = false;
+    usb_is_connected = false;
+  }
+  if (usb_is_connected2)
+  {
+    usb_is_connected2 = false;
   }
 } // usb_suspend
 
