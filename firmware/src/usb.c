@@ -16,7 +16,7 @@
 
 #include "dbserial.h"
 
-#include "sdiosubs.h"
+
 #include "comm.h"
 #include "usbserial.h"
 

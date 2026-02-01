@@ -11,17 +11,16 @@
 
 #include "license.h"
 
-#include "ff.h"
+
 #include "comm.h"
 #include "rtcsubs.h"
 #include "gpiodef.h"
 #include "globals.h"
-#include "sdiosubs.h"
+
 #include "miscsubs.h"
-#include "filesub.h"
-#include "cli.h"
+
 #include "tapedriver.h"
-#include "filedef.h"
+
 #include "dbserial.h"
 
 // Private function prototypes
