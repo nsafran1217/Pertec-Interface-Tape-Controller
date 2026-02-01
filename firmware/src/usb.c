@@ -22,14 +22,23 @@
 
 #define SIZEOFARRAY(x) (sizeof(x) / sizeof((x)[0]))
 
-#define USB_DATA_ENDPOINT_IN  0x81
-#define USB_DATA_ENDPOINT_OUT 0x01
-#define USB_MSC_ENDPOINT_IN   0x82
-#define USB_MSC_ENDPOINT_OUT  0x02
-#define USB_CDC_ENDPOINT_IN   0x83
+#define USB_DATA_ENDPOINT_IN   0x81
+#define USB_DATA_ENDPOINT_OUT  0x01
+#define USB_MSC_ENDPOINT_IN    0x82
+#define USB_MSC_ENDPOINT_OUT   0x02
+#define USB_CDC_ENDPOINT_IN    0x83
 
-#define INTERFACE_NO_1 0
-#define INTERFACE_NO_2 2
+// Second CDC ACM interface endpoints
+#define USB_CDC2_ENDPOINT_IN   0x84
+#define USB_DATA2_ENDPOINT_IN  0x85
+#define USB_DATA2_ENDPOINT_OUT 0x05
+
+// Interface numbers
+#define CDC1_CTRL_IF 0
+#define CDC1_DATA_IF 1
+#define CDC2_CTRL_IF 2
+#define CDC2_DATA_IF 3
+#define MSC_IF       4
 
 #define USB_PACKET_SIZE 64
 #define INPUT_QUEUE_SIZE 1024+64        // size of input queue
@@ -56,6 +65,8 @@ static usbd_device *usb_device;
 
 static bool 
   usb_is_connected = false;
+static bool
+  usb_is_connected2 = false; /* connection flag for second CDC */
 
 static const struct 
   usb_device_descriptor dev_descr = 
@@ -97,13 +108,55 @@ cdcacm_functional_descriptors =
     .bDescriptorSubtype = USB_CDC_TYPE_HEADER,
     .bcdCDC = 0x0110,
   },
+    .call_mgmt =
+    {
+      .bFunctionLength = sizeof(struct usb_cdc_call_management_descriptor),
+      .bDescriptorType = CS_INTERFACE,
+      .bDescriptorSubtype = USB_CDC_TYPE_CALL_MANAGEMENT,
+      .bmCapabilities = 0,
+      .bDataInterface = CDC1_DATA_IF,
+    },
+  .acm =
+  {
+     .bFunctionLength = sizeof(struct usb_cdc_acm_descriptor),
+     .bDescriptorType = CS_INTERFACE,
+     .bDescriptorSubtype = USB_CDC_TYPE_ACM,
+     .bmCapabilities = 0,
+  },
+  .cdc_union = 
+  {
+     .bFunctionLength = sizeof(struct usb_cdc_union_descriptor),
+     .bDescriptorType = CS_INTERFACE,
+     .bDescriptorSubtype = USB_CDC_TYPE_UNION,
+     .bControlInterface = CDC1_CTRL_IF,
+     .bSubordinateInterface0 = CDC1_DATA_IF,
+  }
+};
+
+/* Functional descriptors for second CDC */
+static const struct 
+{
+  struct usb_cdc_header_descriptor header;
+  struct usb_cdc_call_management_descriptor call_mgmt;
+  struct usb_cdc_acm_descriptor acm;
+  struct usb_cdc_union_descriptor cdc_union;
+} __attribute__((packed))
+cdcacm_functional_descriptors2 = 
+{
+  .header =
+  {
+    .bFunctionLength = sizeof(struct usb_cdc_header_descriptor),
+    .bDescriptorType = CS_INTERFACE,
+    .bDescriptorSubtype = USB_CDC_TYPE_HEADER,
+    .bcdCDC = 0x0110,
+  },
   .call_mgmt =
   {
      .bFunctionLength = sizeof(struct usb_cdc_call_management_descriptor),
      .bDescriptorType = CS_INTERFACE,
      .bDescriptorSubtype = USB_CDC_TYPE_CALL_MANAGEMENT,
      .bmCapabilities = 0,
-     .bDataInterface = INTERFACE_NO_1 + 1,
+     .bDataInterface = CDC2_DATA_IF,
   },
   .acm =
   {
@@ -117,8 +170,8 @@ cdcacm_functional_descriptors =
      .bFunctionLength = sizeof(struct usb_cdc_union_descriptor),
      .bDescriptorType = CS_INTERFACE,
      .bDescriptorSubtype = USB_CDC_TYPE_UNION,
-     .bControlInterface = INTERFACE_NO_1,
-     .bSubordinateInterface0 = INTERFACE_NO_1 + 1,
+     .bControlInterface = CDC2_CTRL_IF,
+     .bSubordinateInterface0 = CDC2_DATA_IF,
   }
 };
 
@@ -128,6 +181,18 @@ static const struct usb_endpoint_descriptor comm_endp[] =
     .bLength = USB_DT_ENDPOINT_SIZE,
     .bDescriptorType = USB_DT_ENDPOINT,
     .bEndpointAddress = USB_CDC_ENDPOINT_IN,
+    .bmAttributes = USB_ENDPOINT_ATTR_INTERRUPT,
+    .wMaxPacketSize = 16,
+    .bInterval = 255,
+  }
+};
+
+static const struct usb_endpoint_descriptor comm_endp2[] = 
+{
+  {
+    .bLength = USB_DT_ENDPOINT_SIZE,
+    .bDescriptorType = USB_DT_ENDPOINT,
+    .bEndpointAddress = USB_CDC2_ENDPOINT_IN,
     .bmAttributes = USB_ENDPOINT_ATTR_INTERRUPT,
     .wMaxPacketSize = 16,
     .bInterval = 255,
@@ -148,6 +213,26 @@ static const struct usb_endpoint_descriptor data_endp[] =
     .bLength = USB_DT_ENDPOINT_SIZE,
     .bDescriptorType = USB_DT_ENDPOINT,
     .bEndpointAddress = USB_DATA_ENDPOINT_IN,
+    .bmAttributes = USB_ENDPOINT_ATTR_BULK,
+    .wMaxPacketSize = USB_PACKET_SIZE,
+    .bInterval = 1,
+  }
+};
+
+static const struct usb_endpoint_descriptor data_endp2[] = 
+{
+  {
+    .bLength = USB_DT_ENDPOINT_SIZE,
+    .bDescriptorType = USB_DT_ENDPOINT,
+    .bEndpointAddress = USB_DATA2_ENDPOINT_OUT,
+    .bmAttributes = USB_ENDPOINT_ATTR_BULK,
+    .wMaxPacketSize = USB_PACKET_SIZE,
+    .bInterval = 1,
+  },
+  {
+    .bLength = USB_DT_ENDPOINT_SIZE,
+    .bDescriptorType = USB_DT_ENDPOINT,
+    .bEndpointAddress = USB_DATA2_ENDPOINT_IN,
     .bmAttributes = USB_ENDPOINT_ATTR_BULK,
     .wMaxPacketSize = USB_PACKET_SIZE,
     .bInterval = 1,
@@ -181,7 +266,7 @@ static const struct usb_interface_descriptor comm_iface[] =
   {
     .bLength = USB_DT_INTERFACE_SIZE,
     .bDescriptorType = USB_DT_INTERFACE,
-    .bInterfaceNumber = INTERFACE_NO_1,
+    .bInterfaceNumber = CDC1_CTRL_IF,
     .bAlternateSetting = 0,
     .bNumEndpoints = 1,
     .bInterfaceClass = USB_CLASS_CDC,
@@ -196,12 +281,32 @@ static const struct usb_interface_descriptor comm_iface[] =
   }
 };
 
+static const struct usb_interface_descriptor comm_iface2[] = 
+{
+  {
+    .bLength = USB_DT_INTERFACE_SIZE,
+    .bDescriptorType = USB_DT_INTERFACE,
+    .bInterfaceNumber = CDC2_CTRL_IF,
+    .bAlternateSetting = 0,
+    .bNumEndpoints = 1,
+    .bInterfaceClass = USB_CLASS_CDC,
+    .bInterfaceSubClass = USB_CDC_SUBCLASS_ACM,
+    .bInterfaceProtocol = USB_CDC_PROTOCOL_AT,
+    .iInterface = 0,
+
+    .endpoint = comm_endp2,
+
+    .extra = &cdcacm_functional_descriptors2,
+    .extralen = sizeof(cdcacm_functional_descriptors2),
+  }
+};
+
 static const struct usb_interface_descriptor data_iface[] = 
 {
   {
     .bLength = USB_DT_INTERFACE_SIZE,
     .bDescriptorType = USB_DT_INTERFACE,
-    .bInterfaceNumber = INTERFACE_NO_1 + 1,
+    .bInterfaceNumber = CDC1_DATA_IF,
     .bAlternateSetting = 0,
     .bNumEndpoints = 2,
     .bInterfaceClass = USB_CLASS_DATA,
@@ -213,13 +318,30 @@ static const struct usb_interface_descriptor data_iface[] =
   }
 };
 
+static const struct usb_interface_descriptor data_iface2[] = 
+{
+  {
+    .bLength = USB_DT_INTERFACE_SIZE,
+    .bDescriptorType = USB_DT_INTERFACE,
+    .bInterfaceNumber = CDC2_DATA_IF,
+    .bAlternateSetting = 0,
+    .bNumEndpoints = 2,
+    .bInterfaceClass = USB_CLASS_DATA,
+    .bInterfaceSubClass = 0,
+    .bInterfaceProtocol = 0,
+    .iInterface = 0,
+
+    .endpoint = data_endp2,
+  }
+};
+
 #ifndef DISABLE_USB_MSC
 static const struct usb_interface_descriptor msc_iface[] = 
 {
   {
     .bLength = USB_DT_INTERFACE_SIZE,
     .bDescriptorType = USB_DT_INTERFACE,
-    .bInterfaceNumber = INTERFACE_NO_2,
+    .bInterfaceNumber = MSC_IF,
     .bAlternateSetting = 0,
     .bNumEndpoints = 2,
     .bInterfaceClass = USB_CLASS_MSC,
@@ -235,30 +357,19 @@ static const struct usb_interface_descriptor msc_iface[] =
 #ifndef DISABLE_USB_MSC
 static const struct usb_interface ifaces[] = 
 {
-  {
-    .num_altsetting = 1,
-    .altsetting = comm_iface,
-  },
-  {
-    .num_altsetting = 1,
-    .altsetting = data_iface,
-  },
-  {
-    .num_altsetting = 1,
-    .altsetting = msc_iface,
-  },
+  { .num_altsetting = 1, .altsetting = comm_iface },
+  { .num_altsetting = 1, .altsetting = data_iface },
+  { .num_altsetting = 1, .altsetting = comm_iface2 },
+  { .num_altsetting = 1, .altsetting = data_iface2 },
+  { .num_altsetting = 1, .altsetting = msc_iface },
 };
 #else
 static const struct usb_interface ifaces[] = 
 {
-  {
-    .num_altsetting = 1,
-    .altsetting = comm_iface,
-  },
-  {
-    .num_altsetting = 1,
-    .altsetting = data_iface,
-  },
+  { .num_altsetting = 1, .altsetting = comm_iface },
+  { .num_altsetting = 1, .altsetting = data_iface },
+  { .num_altsetting = 1, .altsetting = comm_iface2 },
+  { .num_altsetting = 1, .altsetting = data_iface2 },
 };
 #endif
 
@@ -268,9 +379,9 @@ static const struct usb_config_descriptor config_descr =
   .bDescriptorType = USB_DT_CONFIGURATION,
   .wTotalLength = 0,
 #ifdef DISABLE_USB_MSC
-  .bNumInterfaces = 2,
+  .bNumInterfaces = 4,
 #else
-  .bNumInterfaces = 3,
+  .bNumInterfaces = 5,
 #endif
   .bConfigurationValue = 1,
   .iConfiguration = 0,
@@ -370,6 +481,16 @@ static void cdcacm_data_rx_cb(usbd_device *usbd_dev, uint8_t ep)
   } // for each received character
 } // cdcacm_data_rx_cb
 
+// Data receive callback for second CDC interface (we discard input or
+// could be extended to a separate queue).
+static void cdcacm_data_rx_cb2(usbd_device *usbd_dev, uint8_t ep)
+{
+  int len;
+  (void)ep;
+  len = usbd_ep_read_packet(usbd_dev, USB_DATA2_ENDPOINT_OUT, ReceiveBuffer, USB_PACKET_SIZE);
+  (void)len; // currently ignore incoming data
+}
+
 static void usb_cdc_set_config_callback(usbd_device *usbd_dev, uint16_t wValue) {
     (void)wValue;
 
@@ -378,11 +499,17 @@ static void usb_cdc_set_config_callback(usbd_device *usbd_dev, uint16_t wValue) 
   if (!usb_is_connected) 
   {
     usb_is_connected = true;
+    usb_is_connected2 = true;
   }
 
   usbd_ep_setup(usbd_dev, USB_DATA_ENDPOINT_OUT, USB_ENDPOINT_ATTR_BULK, USB_PACKET_SIZE, cdcacm_data_rx_cb);
   usbd_ep_setup(usbd_dev, USB_DATA_ENDPOINT_IN, USB_ENDPOINT_ATTR_BULK, USB_PACKET_SIZE, NULL);
   usbd_ep_setup(usbd_dev, USB_CDC_ENDPOINT_IN, USB_ENDPOINT_ATTR_INTERRUPT, 16, NULL);
+
+  /* Setup second CDC endpoints */
+  usbd_ep_setup(usbd_dev, USB_DATA2_ENDPOINT_OUT, USB_ENDPOINT_ATTR_BULK, USB_PACKET_SIZE, cdcacm_data_rx_cb2);
+  usbd_ep_setup(usbd_dev, USB_DATA2_ENDPOINT_IN, USB_ENDPOINT_ATTR_BULK, USB_PACKET_SIZE, NULL);
+  usbd_ep_setup(usbd_dev, USB_CDC2_ENDPOINT_IN, USB_ENDPOINT_ATTR_INTERRUPT, 16, NULL);
 
   usbd_register_control_callback(usbd_dev,
      USB_REQ_TYPE_CLASS | USB_REQ_TYPE_INTERFACE,
@@ -518,6 +645,11 @@ bool usb_get_connected(void)
 {
   return usb_is_connected;
 } // usb_get_connected
+
+bool usb_get_connected2(void)
+{
+  return usb_is_connected2;
+}
 
 void usb_disconnect( void) 
 {
@@ -707,3 +839,58 @@ int USWriteBlock( uint8_t *What, int Count)
   return 0;
 
 } //  USWriteBlock
+
+
+// --- Second CDC interface output wrappers ---
+int USWritechar2( char What)
+{
+  if ( !usb_is_connected2)
+    USInit();
+
+  while (usbd_ep_write_packet(usb_device, USB_DATA2_ENDPOINT_IN, (uint8_t *)&What, 1) == 0);
+  usbd_poll(usb_device);
+  return What;
+}
+
+int USPutchar2( char What)
+{
+  const char *crlf = "\r\n";
+  if ( !usb_is_connected2)
+    USInit();
+  if ( What == '\n')
+  {
+    while (usbd_ep_write_packet(usb_device, USB_DATA2_ENDPOINT_IN, (uint8_t *) crlf, 2) == 0);
+  }
+  else
+  {
+    while (usbd_ep_write_packet(usb_device, USB_DATA2_ENDPOINT_IN, (uint8_t *)&What, 1) == 0);
+  }
+  usbd_poll(usb_device);
+  return What;
+}
+
+int USWriteBlock2( uint8_t *What, int Count)
+{
+  int thisPass;
+  while ( Count != 0)
+  {
+      thisPass = ( Count >= USB_PACKET_SIZE) ? USB_PACKET_SIZE-1 : Count;
+      while( usbd_ep_write_packet(usb_device, USB_DATA2_ENDPOINT_IN, What, thisPass) == 0)
+        usbd_poll(usb_device);
+      What += thisPass;
+      Count -= thisPass;
+  }
+  return 0;
+}
+
+int USGetchar2(void)
+{
+  // Not implemented for second interface input; return 0 or block
+  return 0;
+}
+
+int USCharReady2(void)
+{
+  // No input queue for second interface
+  return 0;
+}

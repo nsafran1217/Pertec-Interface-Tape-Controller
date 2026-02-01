@@ -31,6 +31,7 @@
 #include "filedef.h"
 #include "tapeutil.h"
 #include "tapedriver.h"
+#include "hoststream.h"
 #include "pertbits.h"
 #include "tap.h"
 
@@ -507,7 +508,7 @@ void CmdCreateImage( char *args[])
 {
   FRESULT fres;
   FIL tf;
-  bool noRewind, abort;
+  bool noRewind, abort, toHost;
   int fileCount, tapeMarkSeen;
   uint32_t tapeHeader;
   UINT wc;
@@ -536,6 +537,13 @@ void CmdCreateImage( char *args[])
     if ( toupper( *args[1]) == 'N')
       noRewind = true;
   }
+
+  toHost = false;
+  if (args[2])
+  {
+    if ( toupper(*args[2]) == 'H')
+      toHost = true;
+  }
   
   if ( !IsTapeOnline())
   {
@@ -546,10 +554,16 @@ void CmdCreateImage( char *args[])
   if ( !noRewind)
     TapeRewind();
 
-  if ( (fres = f_open( &tf, args[0], FA_CREATE_ALWAYS | FA_WRITE)) != FR_OK)
-  {
-    Uprintf( "\nError in creating file. Error = %d\n", fres);
-    return;
+  if (!toHost) {
+    if ( (fres = f_open( &tf, args[0], FA_CREATE_ALWAYS | FA_WRITE)) != FR_OK)
+    {
+      Uprintf( "\nError in creating file. Error = %d\n", fres);
+      return;
+    }
+  }
+  else {
+    HostStreamInit();
+    Uprintf("\nStreaming image to host via USB/serial...\n");
   }
 
   LastRecordCount = 0;
@@ -578,11 +592,21 @@ void CmdCreateImage( char *args[])
     writeStart = Milliseconds;
     if (havePrevious)
     {
-      f_write(&tf, &prevHeader, sizeof(prevHeader), &wc);
-      if (prevCount > 0)
+      if (!toHost)
       {
-        f_write(&tf, halfBuf[1 - curBuf], prevCount, &wc);
         f_write(&tf, &prevHeader, sizeof(prevHeader), &wc);
+        if (prevCount > 0)
+        {
+          f_write(&tf, halfBuf[1 - curBuf], prevCount, &wc);
+          f_write(&tf, &prevHeader, sizeof(prevHeader), &wc);
+        }
+      }
+      else
+      {
+        HostStreamWrite((uint8_t *)&prevHeader, sizeof(prevHeader));
+        if (prevCount > 0)
+          HostStreamWrite(halfBuf[1 - curBuf], prevCount);
+        HostStreamWrite((uint8_t *)&prevHeader, sizeof(prevHeader));
       }
       AddRecordCount(prevCount);
     }
@@ -676,11 +700,21 @@ void CmdCreateImage( char *args[])
   writeStart = Milliseconds;
   if (havePrevious)
   {
-    f_write(&tf, &prevHeader, sizeof(prevHeader), &wc);
-    if (prevCount > 0)
+    if (!toHost)
     {
-      f_write(&tf, halfBuf[1 - curBuf], prevCount, &wc);
       f_write(&tf, &prevHeader, sizeof(prevHeader), &wc);
+      if (prevCount > 0)
+      {
+        f_write(&tf, halfBuf[1 - curBuf], prevCount, &wc);
+        f_write(&tf, &prevHeader, sizeof(prevHeader), &wc);
+      }
+    }
+    else
+    {
+      HostStreamWrite((uint8_t *)&prevHeader, sizeof(prevHeader));
+      if (prevCount > 0)
+        HostStreamWrite(halfBuf[1 - curBuf], prevCount);
+      HostStreamWrite((uint8_t *)&prevHeader, sizeof(prevHeader));
     }
     AddRecordCount(prevCount);
   }
@@ -689,19 +723,28 @@ void CmdCreateImage( char *args[])
 
   // Write EOM record
   tapeHeader = TAP_EOM;
-  f_write( &tf, &tapeHeader, sizeof( tapeHeader), &wc);          
+  if (!toHost)
+    f_write( &tf, &tapeHeader, sizeof( tapeHeader), &wc);
+  else
+    HostStreamWrite((uint8_t *)&tapeHeader, sizeof(tapeHeader));
 
   if ( abort)
   {
     Uprintf( "Operation terminated by operator.\n");
   }
-  f_close( &tf);
+  if (!toHost)
+    f_close( &tf);
+  else
+    HostStreamClose();
 
   FlushRecordCount();
-  Uprintf( "\nFile %s written.\n", args[0]);
+  if (!toHost)
+    Uprintf( "\nFile %s written.\n", args[0]);
+  else
+    Uprintf( "\nStream to host complete.\n");
   Uprintf( "\n%d blocks read.\n", TapePosition);
   Uprintf( "%d files; %d bytes copied.\n", fileCount, BytesCopied);
-  if (!abort)
+  if (!abort && !toHost)
     GetComment( args[0]);
   if ( !noRewind)
   {
