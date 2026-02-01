@@ -1,683 +1,486 @@
-#include <stdint.h>
-#include <stdbool.h>
+/*
+ * usb.c - USB CDC Interface for Tape Utility
+ */
+
 #include <stdlib.h>
 #include <string.h>
-
 #include <libopencm3/stm32/rcc.h>
 #include <libopencm3/stm32/gpio.h>
-#include <libopencm3/stm32/desig.h>
-#include <libopencm3/cm3/common.h>
 #include <libopencm3/usb/usbd.h>
-#include <libopencm3/usb/msc.h>
-#include <libopencm3/stm32/f4/nvic.h>
 #include <libopencm3/usb/cdc.h>
-#include <libopencm3/cm3/scb.h>
-#include <libopencm3/usb/dwc/otg_fs.h>
+#include "usb.h"
+#include "tapeutil.h"
+#include "tapedriver.h"
+#include "pertbits.h"
+#include "globals.h"
 
-#include "dbserial.h"
+/* Firmware version */
+#define FW_MAJOR 1
+#define FW_MINOR 0
+#define FW_PATCH 0
+#define PROTOCOL_VER 1
 
+/* Ring buffer sizes (must be power of 2) */
+#define RX_BUF_SIZE 8192
+#define TX_BUF_SIZE 8192
 
-#include "comm.h"
-#include "usbserial.h"
+/* Ring buffer */
+typedef struct {
+    uint8_t *buf;
+    volatile uint16_t head, tail;
+    uint16_t size;
+} ringbuf_t;
 
-#define SIZEOFARRAY(x) (sizeof(x) / sizeof((x)[0]))
+/* Static buffers */
+static uint8_t rx_buf[RX_BUF_SIZE], tx_buf[TX_BUF_SIZE];
+static ringbuf_t rx_ring, tx_ring;
+static uint8_t usb_ctrl_buf[256];
+static usbd_device *usb_dev;
+static volatile bool usb_configured = false;
 
-#define USB_DATA_ENDPOINT_IN  0x81
-#define USB_DATA_ENDPOINT_OUT 0x01
-#define USB_MSC_ENDPOINT_IN   0x82
-#define USB_MSC_ENDPOINT_OUT  0x02
-#define USB_CDC_ENDPOINT_IN   0x83
+/* Command parser state */
+static uint8_t cmd_state = 0;
+static usb_cmd_hdr_t cmd_hdr;
+static uint8_t cmd_payload[USB_MAX_PAYLOAD];
+static uint16_t cmd_payload_idx;
 
-#define INTERFACE_NO_1 0
-#define INTERFACE_NO_2 2
-
-#define USB_PACKET_SIZE 64
-#define INPUT_QUEUE_SIZE 1024+64        // size of input queue
-
-//	Prototypes.
-
-static uint32_t get_block_count(void);
-static int read_block(uint32_t lba, uint8_t *copy_to);
-static int write_block(uint32_t lba, const uint8_t *copy_from);
-static void usb_suspend_callback( void);
-
-static char
-  ReceiveBuffer[ 65],                   // Where characters come in
-  InputQueue[ INPUT_QUEUE_SIZE];        // where we queue input up 
-
-static volatile int
-  InQIn,
-  InQOut;                               // input queue in/out
-
-static char 
-  usb_serial_number[13]; /* 12 bytes of desig and a \0 */
-
-static usbd_device *usb_device;
-
-static bool 
-  usb_is_connected = false;
-
-static const struct 
-  usb_device_descriptor dev_descr = 
-{
-  .bLength = USB_DT_DEVICE_SIZE,
-  .bDescriptorType = USB_DT_DEVICE,
-  .bcdUSB = 0x0200,
-  .bDeviceClass = USB_CLASS_CDC,
-  .bDeviceSubClass = 0,
-  .bDeviceProtocol = 0,
-  .bMaxPacketSize0 = 64,
-  .idVendor = 0x0483,         // ST Microelectronics
-  .idProduct = 0x5740,        // STM32F407--the easiest one we can use
-  .bcdDevice = 0x0200,
-  .iManufacturer = 1,
-  .iProduct = 2,
-  .iSerialNumber = 3,
-  .bNumConfigurations = 1,
+/* Current configuration */
+static usb_config_t usb_config = {
+    .retries = 3,
+    .stop_tapemarks = 2,
+    .stop_on_error = 0,
+    .density = 0,
+    .tape_address = 0,
+    .timeout_ms = 5000
 };
 
-static const struct 
-{
-  struct usb_cdc_header_descriptor 
-    header;
-  struct usb_cdc_call_management_descriptor 
-    call_mgmt;
-  struct usb_cdc_acm_descriptor 
-    acm;
-  struct usb_cdc_union_descriptor 
-    cdc_union;
-} __attribute__((packed))
-
-cdcacm_functional_descriptors = 
-{
-  .header =
-  {
-    .bFunctionLength = sizeof(struct usb_cdc_header_descriptor),
-    .bDescriptorType = CS_INTERFACE,
-    .bDescriptorSubtype = USB_CDC_TYPE_HEADER,
-    .bcdCDC = 0x0110,
-  },
-  .call_mgmt =
-  {
-     .bFunctionLength = sizeof(struct usb_cdc_call_management_descriptor),
-     .bDescriptorType = CS_INTERFACE,
-     .bDescriptorSubtype = USB_CDC_TYPE_CALL_MANAGEMENT,
-     .bmCapabilities = 0,
-     .bDataInterface = INTERFACE_NO_1 + 1,
-  },
-  .acm =
-  {
-     .bFunctionLength = sizeof(struct usb_cdc_acm_descriptor),
-     .bDescriptorType = CS_INTERFACE,
-     .bDescriptorSubtype = USB_CDC_TYPE_ACM,
-     .bmCapabilities = 0,
-  },
-  .cdc_union = 
-  {
-     .bFunctionLength = sizeof(struct usb_cdc_union_descriptor),
-     .bDescriptorType = CS_INTERFACE,
-     .bDescriptorSubtype = USB_CDC_TYPE_UNION,
-     .bControlInterface = INTERFACE_NO_1,
-     .bSubordinateInterface0 = INTERFACE_NO_1 + 1,
-  }
+/* USB Descriptors */
+static const struct usb_device_descriptor dev_desc = {
+    .bLength = USB_DT_DEVICE_SIZE,
+    .bDescriptorType = USB_DT_DEVICE,
+    .bcdUSB = 0x0200,
+    .bDeviceClass = USB_CLASS_CDC,
+    .bDeviceSubClass = 0,
+    .bDeviceProtocol = 0,
+    .bMaxPacketSize0 = 64,
+    .idVendor = 0x1209,
+    .idProduct = 0x0001,
+    .bcdDevice = 0x0100,
+    .iManufacturer = 1,
+    .iProduct = 2,
+    .iSerialNumber = 3,
+    .bNumConfigurations = 1,
 };
 
-static const struct usb_endpoint_descriptor comm_endp[] = 
-{
-  {
+static const struct usb_endpoint_descriptor comm_ep[] = {{
     .bLength = USB_DT_ENDPOINT_SIZE,
     .bDescriptorType = USB_DT_ENDPOINT,
-    .bEndpointAddress = USB_CDC_ENDPOINT_IN,
+    .bEndpointAddress = 0x83,
     .bmAttributes = USB_ENDPOINT_ATTR_INTERRUPT,
     .wMaxPacketSize = 16,
     .bInterval = 255,
-  }
-};
+}};
 
-static const struct usb_endpoint_descriptor data_endp[] = 
-{
-  {
+static const struct usb_endpoint_descriptor data_ep[] = {{
     .bLength = USB_DT_ENDPOINT_SIZE,
     .bDescriptorType = USB_DT_ENDPOINT,
-    .bEndpointAddress = USB_DATA_ENDPOINT_OUT,
+    .bEndpointAddress = 0x01,
     .bmAttributes = USB_ENDPOINT_ATTR_BULK,
-    .wMaxPacketSize = USB_PACKET_SIZE,
+    .wMaxPacketSize = 64,
     .bInterval = 1,
-  },
-  {
+}, {
     .bLength = USB_DT_ENDPOINT_SIZE,
     .bDescriptorType = USB_DT_ENDPOINT,
-    .bEndpointAddress = USB_DATA_ENDPOINT_IN,
+    .bEndpointAddress = 0x82,
     .bmAttributes = USB_ENDPOINT_ATTR_BULK,
-    .wMaxPacketSize = USB_PACKET_SIZE,
+    .wMaxPacketSize = 64,
     .bInterval = 1,
-  }
+}};
+
+static const struct {
+    struct usb_cdc_header_descriptor header;
+    struct usb_cdc_call_management_descriptor call_mgmt;
+    struct usb_cdc_acm_descriptor acm;
+    struct usb_cdc_union_descriptor cdc_union;
+} __attribute__((packed)) cdcacm_functional_descriptors = {
+    .header = {
+        .bFunctionLength = sizeof(struct usb_cdc_header_descriptor),
+        .bDescriptorType = CS_INTERFACE,
+        .bDescriptorSubtype = USB_CDC_TYPE_HEADER,
+        .bcdCDC = 0x0110,
+    },
+    .call_mgmt = {
+        .bFunctionLength = sizeof(struct usb_cdc_call_management_descriptor),
+        .bDescriptorType = CS_INTERFACE,
+        .bDescriptorSubtype = USB_CDC_TYPE_CALL_MANAGEMENT,
+        .bmCapabilities = 0,
+        .bDataInterface = 1,
+    },
+    .acm = {
+        .bFunctionLength = sizeof(struct usb_cdc_acm_descriptor),
+        .bDescriptorType = CS_INTERFACE,
+        .bDescriptorSubtype = USB_CDC_TYPE_ACM,
+        .bmCapabilities = 0,
+    },
+    .cdc_union = {
+        .bFunctionLength = sizeof(struct usb_cdc_union_descriptor),
+        .bDescriptorType = CS_INTERFACE,
+        .bDescriptorSubtype = USB_CDC_TYPE_UNION,
+        .bControlInterface = 0,
+        .bSubordinateInterface0 = 1,
+    },
 };
 
-static const struct usb_endpoint_descriptor msc_endp[] = 
-{
-  {
-   .bLength = USB_DT_ENDPOINT_SIZE,
-   .bDescriptorType = USB_DT_ENDPOINT,
-   .bEndpointAddress = USB_MSC_ENDPOINT_OUT,
-   .bmAttributes = USB_ENDPOINT_ATTR_BULK,
-   .wMaxPacketSize = USB_PACKET_SIZE,
-   .bInterval = 1,
-  },
-  {
-    .bLength = USB_DT_ENDPOINT_SIZE,
-    .bDescriptorType = USB_DT_ENDPOINT,
-    .bEndpointAddress = USB_MSC_ENDPOINT_IN,
-    .bmAttributes = USB_ENDPOINT_ATTR_BULK,
-    .wMaxPacketSize = USB_PACKET_SIZE,
-    .bInterval = 1,
-  }
-};
-
-static const struct usb_interface_descriptor comm_iface[] = 
-{
-  {
+static const struct usb_interface_descriptor comm_iface[] = {{
     .bLength = USB_DT_INTERFACE_SIZE,
     .bDescriptorType = USB_DT_INTERFACE,
-    .bInterfaceNumber = INTERFACE_NO_1,
+    .bInterfaceNumber = 0,
     .bAlternateSetting = 0,
     .bNumEndpoints = 1,
     .bInterfaceClass = USB_CLASS_CDC,
     .bInterfaceSubClass = USB_CDC_SUBCLASS_ACM,
     .bInterfaceProtocol = USB_CDC_PROTOCOL_AT,
     .iInterface = 0,
-
-    .endpoint = comm_endp,
-
+    .endpoint = comm_ep,
     .extra = &cdcacm_functional_descriptors,
     .extralen = sizeof(cdcacm_functional_descriptors),
-  }
-};
+}};
 
-static const struct usb_interface_descriptor data_iface[] = 
-{
-  {
+static const struct usb_interface_descriptor data_iface[] = {{
     .bLength = USB_DT_INTERFACE_SIZE,
     .bDescriptorType = USB_DT_INTERFACE,
-    .bInterfaceNumber = INTERFACE_NO_1 + 1,
+    .bInterfaceNumber = 1,
     .bAlternateSetting = 0,
     .bNumEndpoints = 2,
     .bInterfaceClass = USB_CLASS_DATA,
     .bInterfaceSubClass = 0,
     .bInterfaceProtocol = 0,
     .iInterface = 0,
+    .endpoint = data_ep,
+}};
 
-    .endpoint = data_endp,
-  }
+static const struct usb_interface ifaces[] = {
+    { .num_altsetting = 1, .altsetting = comm_iface },
+    { .num_altsetting = 1, .altsetting = data_iface },
 };
 
-static const struct usb_interface_descriptor msc_iface[] = 
-{
-  {
-    .bLength = USB_DT_INTERFACE_SIZE,
-    .bDescriptorType = USB_DT_INTERFACE,
-    .bInterfaceNumber = INTERFACE_NO_2,
-    .bAlternateSetting = 0,
-    .bNumEndpoints = 2,
-    .bInterfaceClass = USB_CLASS_MSC,
-    .bInterfaceSubClass = USB_MSC_SUBCLASS_SCSI,
-    .bInterfaceProtocol = USB_MSC_PROTOCOL_BBB,
-    .iInterface = 0,
-
-    .endpoint = msc_endp,
-  }
+static const struct usb_config_descriptor conf_desc = {
+    .bLength = USB_DT_CONFIGURATION_SIZE,
+    .bDescriptorType = USB_DT_CONFIGURATION,
+    .wTotalLength = 0,
+    .bNumInterfaces = 2,
+    .bConfigurationValue = 1,
+    .iConfiguration = 0,
+    .bmAttributes = 0x80,
+    .bMaxPower = 0x32,
+    .interface = ifaces,
 };
 
-static const struct usb_interface ifaces[] = 
-{
-  {
-    .num_altsetting = 1,
-    .altsetting = comm_iface,
-  },
-  {
-    .num_altsetting = 1,
-    .altsetting = data_iface,
-  },
-  {
-    .num_altsetting = 1,
-    .altsetting = msc_iface,
-  },
+static const char *usb_strings[] = {
+    "PERTEC Tape Interface",
+    "STM32 Tape Controller",
+    "001",
 };
 
-static const struct usb_config_descriptor config_descr = 
-{
-  .bLength = USB_DT_CONFIGURATION_SIZE,
-  .bDescriptorType = USB_DT_CONFIGURATION,
-  .wTotalLength = 0,
-  .bNumInterfaces = 3,
-  .bConfigurationValue = 1,
-  .iConfiguration = 0,
-  .bmAttributes = 0x80,
-  .bMaxPower = 0x32,
-  .interface = ifaces,
-};
+/* Ring buffer helpers */
+static void rb_init(ringbuf_t *rb, uint8_t *buf, uint16_t size) {
+    rb->buf = buf; rb->head = rb->tail = 0; rb->size = size;
+}
+static uint16_t rb_used(ringbuf_t *rb) {
+    return (rb->head - rb->tail) & (rb->size - 1);
+}
+static uint16_t rb_free(ringbuf_t *rb) {
+    return rb->size - 1 - rb_used(rb);
+}
+static void rb_put(ringbuf_t *rb, uint8_t c) {
+    rb->buf[rb->head] = c;
+    rb->head = (rb->head + 1) & (rb->size - 1);
+}
+static uint8_t rb_get(ringbuf_t *rb) {
+    uint8_t c = rb->buf[rb->tail];
+    rb->tail = (rb->tail + 1) & (rb->size - 1);
+    return c;
+}
+static void rb_write(ringbuf_t *rb, const uint8_t *data, uint16_t len) {
+    while (len--) rb_put(rb, *data++);
+}
+static void rb_read(ringbuf_t *rb, uint8_t *data, uint16_t len) {
+    while (len--) *data++ = rb_get(rb);
+}
 
-static const char *usb_strings[] = 
-{
-  "Tape Controller",
-  "",
-  usb_serial_number,
-};
+/* CRC-16-CCITT */
+uint16_t USB_CRC16(const uint8_t *data, uint16_t len) {
+    uint16_t crc = 0xFFFF;
+    while (len--) {
+        crc = ((crc >> 8) | (crc << 8)) & 0xFFFF;
+        crc ^= *data++;
+        crc ^= (crc & 0xFF) >> 4;
+        crc ^= (crc << 12) & 0xFFFF;
+        crc ^= ((crc & 0xFF) << 5) & 0xFFFF;
+    }
+    return crc;
+}
 
-// Buffer to be used for control requests. 
+/* Send response */
+static void send_response(uint8_t status, uint16_t seq, const void *data, uint16_t len) {
+    usb_resp_hdr_t hdr = { .sync = RESP_SYNC_BYTE, .status = status, .seq = seq, .len = len };
+    uint16_t crc = USB_CRC16((uint8_t*)&hdr, 6);
+    if (len && data) crc ^= USB_CRC16(data, len);
+    hdr.crc = crc;
+    rb_write(&tx_ring, (uint8_t*)&hdr, sizeof(hdr));
+    if (len && data) rb_write(&tx_ring, data, len);
+}
 
-uint8_t 
-  usbd_control_buffer[128];
+/* Translate tape status to response code */
+static uint8_t translate_status(uint16_t tstat) {
+    if (tstat & TSTAT_OFFLINE)   return RESP_ERR_OFFLINE;
+    if (tstat & TSTAT_HARDERR)   return RESP_HARDERR;
+    if (tstat & TSTAT_TAPEMARK)  return RESP_TAPEMARK;
+    if (tstat & TSTAT_EOT)       return RESP_EOT;
+    if (tstat & TSTAT_BLANK)     return RESP_BLANK;
+    if (tstat & TSTAT_LENGTH)    return RESP_LENGTH;
+    if (tstat & TSTAT_PROTECT)   return RESP_ERR_PROTECTED;
+    if (tstat & TSTAT_CORRERR)   return RESP_CORRERR;
+    return RESP_OK;
+}
 
-//*	CDC ACM Control Request - Serivce CDC ACM control request.
-//	----------------------------------------------------------
-//
+/* Command handlers */
+static void handle_get_info(uint16_t seq) {
+    usb_device_info_t info = {
+        .protocol_ver = PROTOCOL_VER,
+        .fw_major = FW_MAJOR, .fw_minor = FW_MINOR, .fw_patch = FW_PATCH,
+        .capabilities = 0x03,
+        .max_payload = USB_MAX_PAYLOAD,
+        .buffer_size = TAPE_BUFFER_SIZE
+    };
+    send_response(RESP_OK, seq, &info, sizeof(info));
+}
 
-static enum usbd_request_return_codes cdcacm_control_request(
-        usbd_device *usbd_dev, struct usb_setup_data *req, 
-        uint8_t **buf, uint16_t *len, 
-        void (**complete)(usbd_device *usbd_dev, struct usb_setup_data *req)) 
-{
+static void handle_get_status(uint16_t seq) {
+    tape_status_t ts;
+    TapeUtil_GetStatus(&ts);
+    usb_tape_status_t st = {
+        .raw_status = ts.raw_status,
+        .online = ts.online,
+        .ready = ts.ready,
+        .loadpoint = ts.loadpoint,
+        .eot = ts.eot,
+        .protected = ts.protected,
+        .rewinding = ts.rewinding,
+        .filemark = ts.filemark,
+        .error = ts.hard_error || ts.soft_error,
+        .position = ts.position
+    };
+    send_response(RESP_OK, seq, &st, sizeof(st));
+}
 
-  (void)complete;
-  (void)usbd_dev;
+static void handle_get_config(uint16_t seq) {
+    usb_config.retries = TapeRetries;
+    usb_config.stop_tapemarks = StopTapemarks;
+    usb_config.stop_on_error = StopAfterError ? 1 : 0;
+    send_response(RESP_OK, seq, &usb_config, sizeof(usb_config));
+}
 
-// Dummy line codig for the benefit of Windows
+static void handle_set_config(uint16_t seq, const uint8_t *data, uint16_t len) {
+    if (len < sizeof(usb_config_t)) {
+        send_response(RESP_ERR_PARAM, seq, NULL, 0);
+        return;
+    }
+    memcpy(&usb_config, data, sizeof(usb_config));
+    TapeRetries = usb_config.retries;
+    StopTapemarks = usb_config.stop_tapemarks;
+    StopAfterError = usb_config.stop_on_error;
+    send_response(RESP_OK, seq, NULL, 0);
+}
 
-  static const struct usb_cdc_line_coding line_coding = 
-  {
-    .dwDTERate = 115200,
-    .bCharFormat = USB_CDC_1_STOP_BITS,
-    .bParityType = USB_CDC_NO_PARITY,
-    .bDataBits = 0x08
-  };
+static void handle_set_density(uint16_t seq, const uint8_t *data) {
+    if (!TapeUtil_SetDensity(data[0])) {
+        send_response(RESP_ERR_PARAM, seq, NULL, 0);  /* Must be at BOT */
+        return;
+    }
+    send_response(RESP_OK, seq, NULL, 0);
+}
 
-  switch (req->bRequest) 
-  {
-    case USB_CDC_REQ_SET_CONTROL_LINE_STATE: 
-      return USBD_REQ_HANDLED;
+static void handle_rewind(uint16_t seq) {
+    uint16_t stat = TapeUtil_Rewind();
+    send_response(translate_status(stat), seq, NULL, 0);
+}
 
-    case USB_CDC_REQ_GET_LINE_CODING:
-      if ( *len < sizeof(struct usb_cdc_line_coding) ) 
-      {
-	return USBD_REQ_NOTSUPP;
-      }
-      *buf = (uint8_t *) &line_coding;
-      *len = sizeof(struct usb_cdc_line_coding);
-      return USBD_REQ_HANDLED;
+static void handle_unload(uint16_t seq) {
+    uint16_t stat = TapeUtil_Unload();
+    send_response(translate_status(stat), seq, NULL, 0);
+}
 
-    case USB_CDC_REQ_SET_LINE_CODING:
-      if (*len < sizeof(struct usb_cdc_line_coding)) 
-      {
+static void handle_skip_block(uint16_t seq, const uint8_t *data) {
+    int16_t count = (int16_t)(data[0] | (data[1] << 8));
+    uint16_t stat = TapeUtil_SkipBlock(count);
+    send_response(translate_status(stat), seq, NULL, 0);
+}
+
+static void handle_skip_file(uint16_t seq, const uint8_t *data) {
+    int16_t count = (int16_t)(data[0] | (data[1] << 8));
+    uint16_t stat = TapeUtil_SkipFile(count);
+    send_response(translate_status(stat), seq, NULL, 0);
+}
+
+static void handle_read_block(uint16_t seq) {
+    int bytesRead = 0;
+    uint8_t flags = 0;
+    uint16_t stat = TapeUtil_ReadBlock(TapeBuffer, TAPE_BUFFER_SIZE, &bytesRead, &flags);
+    
+    usb_read_hdr_t hdr = { .length = bytesRead, .flags = flags };
+    
+    /* Build response with header + data */
+    uint8_t resp_status = translate_status(stat);
+    if (bytesRead > 0) resp_status = RESP_DATA;
+    
+    uint16_t total_len = sizeof(hdr) + bytesRead;
+    usb_resp_hdr_t resp = { .sync = RESP_SYNC_BYTE, .status = resp_status, .seq = seq, .len = total_len };
+    uint16_t crc = USB_CRC16((uint8_t*)&resp, 6);
+    crc ^= USB_CRC16((uint8_t*)&hdr, sizeof(hdr));
+    if (bytesRead) crc ^= USB_CRC16(TapeBuffer, bytesRead);
+    resp.crc = crc;
+    
+    rb_write(&tx_ring, (uint8_t*)&resp, sizeof(resp));
+    rb_write(&tx_ring, (uint8_t*)&hdr, sizeof(hdr));
+    if (bytesRead) rb_write(&tx_ring, TapeBuffer, bytesRead);
+}
+
+static void handle_write_block(uint16_t seq, const uint8_t *data, uint16_t len) {
+    uint16_t stat = TapeUtil_WriteBlock(data, len);
+    send_response(translate_status(stat), seq, NULL, 0);
+}
+
+static void handle_write_filemark(uint16_t seq) {
+    uint16_t stat = TapeUtil_WriteFilemark();
+    send_response(translate_status(stat), seq, NULL, 0);
+}
+
+/* Process a complete command */
+static void process_command(void) {
+    uint16_t seq = cmd_hdr.seq;
+    switch (cmd_hdr.cmd) {
+        case CMD_NOP:           send_response(RESP_OK, seq, NULL, 0); break;
+        case CMD_GET_INFO:      handle_get_info(seq); break;
+        case CMD_GET_STATUS:    handle_get_status(seq); break;
+        case CMD_GET_CONFIG:    handle_get_config(seq); break;
+        case CMD_SET_CONFIG:    handle_set_config(seq, cmd_payload, cmd_hdr.len); break;
+        case CMD_SET_DENSITY:   handle_set_density(seq, cmd_payload); break;
+        case CMD_REWIND:        handle_rewind(seq); break;
+        case CMD_UNLOAD:        handle_unload(seq); break;
+        case CMD_SKIP_BLOCK:    handle_skip_block(seq, cmd_payload); break;
+        case CMD_SKIP_FILE:     handle_skip_file(seq, cmd_payload); break;
+        case CMD_READ_BLOCK:    handle_read_block(seq); break;
+        case CMD_WRITE_BLOCK:   handle_write_block(seq, cmd_payload, cmd_hdr.len); break;
+        case CMD_WRITE_FILEMARK: handle_write_filemark(seq); break;
+        case CMD_RESET:
+            TapeUtil_ResetCounters();
+            send_response(RESP_OK, seq, NULL, 0);
+            break;
+        default:
+            send_response(RESP_ERR_CMD, seq, NULL, 0);
+            break;
+    }
+}
+
+/* USB Callbacks */
+static enum usbd_request_return_codes cdcacm_control(usbd_device *dev,
+    struct usb_setup_data *req, uint8_t **buf, uint16_t *len,
+    void (**complete)(usbd_device*, struct usb_setup_data*)) {
+    (void)dev; (void)complete; (void)buf; (void)len;
+    if (req->bmRequestType != 0x21 || req->bRequest != USB_CDC_REQ_SET_CONTROL_LINE_STATE)
         return USBD_REQ_NOTSUPP;
-      }
-      return USBD_REQ_HANDLED;
-  } // switch
-  return USBD_REQ_NOTSUPP;
-} // cdcacm_control_request
+    return USBD_REQ_HANDLED;
+}
 
+static void cdcacm_data_rx(usbd_device *dev, uint8_t ep) {
+    (void)ep;
+    uint8_t buf[64];
+    int len = usbd_ep_read_packet(dev, 0x01, buf, 64);
+    if (len > 0 && rb_free(&rx_ring) >= (uint16_t)len)
+        rb_write(&rx_ring, buf, len);
+}
 
-//  CDC_ACM Received data request.
-//  ------------------------------
-//
-//  This is where we get a data packet from the host.
-//
+static void cdcacm_set_config(usbd_device *dev, uint16_t val) {
+    (void)val;
+    usbd_ep_setup(dev, 0x01, USB_ENDPOINT_ATTR_BULK, 64, cdcacm_data_rx);
+    usbd_ep_setup(dev, 0x82, USB_ENDPOINT_ATTR_BULK, 64, NULL);
+    usbd_ep_setup(dev, 0x83, USB_ENDPOINT_ATTR_INTERRUPT, 16, NULL);
+    usbd_register_control_callback(dev, USB_REQ_TYPE_CLASS | USB_REQ_TYPE_INTERFACE,
+        USB_REQ_TYPE_TYPE | USB_REQ_TYPE_RECIPIENT, cdcacm_control);
+    usb_configured = true;
+}
 
-static void cdcacm_data_rx_cb(usbd_device *usbd_dev, uint8_t ep)
-{
-  int 
-    len,
-    i;
+/* Public API */
+void USB_Init(void) {
+    rb_init(&rx_ring, rx_buf, RX_BUF_SIZE);
+    rb_init(&tx_ring, tx_buf, TX_BUF_SIZE);
+    
+    /* Initialize tape utility module */
+    TapeUtil_Init();
+    
+    gpio_mode_setup(GPIOA, GPIO_MODE_AF, GPIO_PUPD_NONE, GPIO11 | GPIO12);
+    gpio_set_af(GPIOA, GPIO_AF10, GPIO11 | GPIO12);
+    
+    usb_dev = usbd_init(&otgfs_usb_driver, &dev_desc, &conf_desc,
+        usb_strings, 3, usb_ctrl_buf, sizeof(usb_ctrl_buf));
+    usbd_register_set_config_callback(usb_dev, cdcacm_set_config);
+}
 
-  (void)ep;
+bool USB_IsConnected(void) {
+    return usb_configured;
+}
 
-  len = usbd_ep_read_packet(usbd_dev, USB_DATA_ENDPOINT_OUT, 
-            ReceiveBuffer, USB_PACKET_SIZE);
-
-  for ( i = 0; i < len; i++)
-  {
-    int iq;
-    iq = InQIn+1;
-    if ( iq >= INPUT_QUEUE_SIZE)
-      iq = 0;
-    if ( iq != InQOut)
-    {  
-      InputQueue[InQIn] = ReceiveBuffer[i];
-      InQIn = iq;               // next in
+void USB_Poll(void) {
+    usbd_poll(usb_dev);
+    
+    /* Transmit pending data */
+    uint8_t buf[64];
+    uint16_t len = rb_used(&tx_ring);
+    if (len > 64) len = 64;
+    if (len > 0) {
+        rb_read(&tx_ring, buf, len);
+        while (usbd_ep_write_packet(usb_dev, 0x82, buf, len) == 0)
+            usbd_poll(usb_dev);
     }
-  } // for each received character
-} // cdcacm_data_rx_cb
+}
 
-static void usb_cdc_set_config_callback(usbd_device *usbd_dev, uint16_t wValue) {
-    (void)wValue;
-
-// We are being configured, usb must be connected.
-
-  if (!usb_is_connected) 
-  {
-    usb_is_connected = true;
-  }
-
-  usbd_ep_setup(usbd_dev, USB_DATA_ENDPOINT_OUT, USB_ENDPOINT_ATTR_BULK, USB_PACKET_SIZE, cdcacm_data_rx_cb);
-  usbd_ep_setup(usbd_dev, USB_DATA_ENDPOINT_IN, USB_ENDPOINT_ATTR_BULK, USB_PACKET_SIZE, NULL);
-  usbd_ep_setup(usbd_dev, USB_CDC_ENDPOINT_IN, USB_ENDPOINT_ATTR_INTERRUPT, 16, NULL);
-
-  usbd_register_control_callback(usbd_dev,
-     USB_REQ_TYPE_CLASS | USB_REQ_TYPE_INTERFACE,
-     USB_REQ_TYPE_TYPE | USB_REQ_TYPE_RECIPIENT,
-     cdcacm_control_request);
-} // usb_cdc_set_config_callback
-
-static void usb_suspend_callback() 
-{
-// We are being suspended, disconnect.
-  if (usb_is_connected) 
-  {
-        usb_is_connected = false;
-  }
-} // usb_suspend
-
-//*	Mass storage routines.
-//	----------------------
-//	
-//	All refer to routines in dskio.c
-//
-
-static uint32_t get_block_count(void) 
-{
-  DBprintf( "Get block count returns %d\n", SD_GetCardSize());
-
-    return SD_GetCardSize();
-} // get_block_count
-
-//*	Read an SD block.
-//	-----------------
-//
-//	Called from the MSC driver
-//
-
-static int read_block(uint32_t lba, uint8_t *copy_to) 
-{
-
-  int stat;
-
-  stat = SD_ReadBlocks( copy_to, lba, 1);
-  SD_WaitComplete();
-  return stat;
-} // read_block
-
-//*	Write an SD block
-//	-----------------
-//
-//	Called from the MSC driver
-//	
-
-static int write_block(uint32_t lba, const uint8_t *copy_from) 
-{
-
-  int stat;
-
-  stat = SD_WriteBlocks( (void *) copy_from, lba, 1);
-  SD_WaitComplete();
-  return stat;
-} // write_block
-
-
-//  USInit - Initialize USB interface.
-//  -----------------------------------
-//
-//  Must be called before any I/O is done.  Returns 0.
-//
-
-int USInit(void) 
-{
-
-  rcc_periph_clock_enable(RCC_GPIOA);
-//  rcc_periph_clock_enable(RCC_OTGHS);
-  rcc_periph_clock_enable(RCC_OTGFS);
-
-  gpio_mode_setup(GPIOA, GPIO_MODE_AF, GPIO_PUPD_NONE, GPIO11 | GPIO12);
-  gpio_set_af(GPIOA, GPIO_AF10, GPIO11 | GPIO12);
-
-  desig_get_unique_id_as_string(usb_serial_number, sizeof(usb_serial_number));
-
-  OTG_FS_GCCFG |= OTG_GCCFG_NOVBUSSENS | OTG_GCCFG_PWRDWN;
-  OTG_FS_GCCFG &= ~(OTG_GCCFG_VBUSBSEN | OTG_GCCFG_VBUSASEN);
-  OTG_FS_GUSBCFG |= OTG_GUSBCFG_FDMOD;		// force device mode
-
-  usb_device = usbd_init(&otgfs_usb_driver,
-                         &dev_descr,
-                         &config_descr,
-                         usb_strings,
-                         SIZEOFARRAY(usb_strings),
-                         usbd_control_buffer,
-                         sizeof(usbd_control_buffer));
-
-
-  usbd_register_set_config_callback(usb_device, usb_cdc_set_config_callback);
-  usbd_register_suspend_callback(usb_device, usb_suspend_callback);
-
-  if (!SD_GetCardSize())
-  {
-    DBprintf( "Initializing SD I/O\n");
-    SD_Init();				// if SD not initialized
-    DBprintf( "SD init returns\n");
-  }
-
-  usb_msc_init(usb_device,
-               USB_MSC_ENDPOINT_IN,
-               USB_PACKET_SIZE,
-               USB_MSC_ENDPOINT_OUT,
-               USB_PACKET_SIZE,
-               "Sydex",
-               "SD Card",
-               "0.01",
-               get_block_count(),
-               read_block,
-               write_block);
-
-
-  return 0;               
-} // USInit
-
-void otg_fs_isr(void) 
-{
-  if (usb_device) 
-  {
-      usbd_poll(usb_device);
-  }
-} // otg_fs_isr
-
-bool usb_get_connected(void) 
-{
-  return usb_is_connected;
-} // usb_get_connected
-
-void usb_disconnect( void) 
-{
-  if (usb_device) 
-  {
-    usbd_disconnect(usb_device, true);
-  }
-} // usb_disconnect
-
-//*	Character Input.
-//	----------------
-
-//*     USClear - Clear buffer contents.
-//      --------------------------------
-//
-//      Removes any initialization messages from input buffer.
-//
-
-void USClear( void)
-{
-
-  InQIn = 0;            
-  InQOut = 0;           // empty the input buffer
-} // USClear
-
-//  USGetchar - Get a character from input.
-//  ---------------------------------------
-//
-//    Not the most efficient.  We ignore any buffer overflow.
-//
-
-int USGetchar( void)
-{
-
-  char
-    retChar;
-
-  if ( !usb_is_connected)
-    USInit();             // if not initialized, do it.
-  while (InQIn == InQOut)
-  {
-    usbd_poll( usb_device);       // wait for input
-  } // get a character if there's none
-  
-//  At this point we know that there's something in the buffer.  
-  
-  retChar = InputQueue[ InQOut++];      // get the character
-  if ( InQOut >= INPUT_QUEUE_SIZE)
-    InQOut = 0;                         // wrap around to the start
-  return (unsigned char) retChar;
-} // USGetchar
-
-//* USCharReady - See if a character is waiting.
-//  --------------------------------------------
-//
-//  Return 0 if no character; 1 otherwise.
-//
-
-int USCharReady( void)
-{
-  if ( !usb_is_connected)
-    USInit();             // if not initialized, do it.
-
-  usbd_poll(usb_device);    // poll
-  return ( InQIn == InQOut) ? 0 : 1;
-} // USCharReady
-
-//*	Character output.
-//	-----------------
-
-
-//* USWritechar - Write a single character without "cooking"
-//  --------------------------------------------------------
-//
-//    Just passes the data through.
-//
-
-int USWritechar( char What)
-{
-
-  if ( !usb_is_connected)
-    USInit();             // if not initialized, do it.
-
-  while (usbd_ep_write_packet(usb_device, USB_DATA_ENDPOINT_IN, 
-      (uint8_t *)&What, 1) == 0);
-
-  usbd_poll(usb_device);    // poll
-  return What;
-} // USWritechar
-
-
-//* USPutchar - Put a single character to output.
-//  ---------------------------------------------
-//
-//    If you've got a string, use USPuts(); it's faster.
-//
-
-int USPutchar( char What)
-{
-
-  const char *crlf="\r\n";
-
-  if ( !usb_is_connected)
-    USInit();             // if not initialized, do it.
-  if ( What == '\n')
-  {
-    while (usbd_ep_write_packet(usb_device, USB_DATA_ENDPOINT_IN, 
-      (uint8_t *) crlf, 2) == 0);
-  }
-  else  
-  {
-    while (usbd_ep_write_packet(usb_device, USB_DATA_ENDPOINT_IN, 
-      (uint8_t *)&What, 1) == 0);
-  }
-  usbd_poll(usb_device);    // poll
-  return What;
-} // USPutchar
-
-//* USPuts - Put a character string to output.
-//  ------------------------------------------
-//
-//  Uses packet-mode transfer, so is somewhat faster.
-//
-
-void USPuts( char *What)
-{
- 
-  char
-    localBuf[64];
-  char 
-    *p;
-  int
-    i;
-
-   
-  if ( !usb_is_connected)
-    USInit();             // if not initialized, do it.
-
-  while (*What)
-  {
-    p = localBuf;
-    for (  i = 0; i < 62; i++)
-    {
-      if ( *What == 0)
-        break;
-      if ( *What == '\n')
-      {
-        *p++ = '\r';        // make sure of cr-lf  
-        i++;
-      } // convert LF to CR-LF  
-      *p++ = *What++;
-    } // for
-    if ( i)
-    {  // if we have anything to write
-      while (usbd_ep_write_packet(usb_device, USB_DATA_ENDPOINT_IN, 
-        (uint8_t *) localBuf, i) == 0);
+bool USB_ProcessCommands(void) {
+    bool processed = false;
+    
+    while (rb_used(&rx_ring)) {
+        uint8_t c = rb_get(&rx_ring);
+        switch (cmd_state) {
+            case 0: if (c == CMD_SYNC_BYTE) cmd_state = 1; break;
+            case 1: cmd_hdr.cmd = c; cmd_state = 2; break;
+            case 2: cmd_hdr.seq = c; cmd_state = 3; break;
+            case 3: cmd_hdr.seq |= c << 8; cmd_state = 4; break;
+            case 4: cmd_hdr.len = c; cmd_state = 5; break;
+            case 5: cmd_hdr.len |= c << 8; cmd_state = 6; break;
+            case 6: cmd_hdr.crc = c; cmd_state = 7; break;
+            case 7:
+                cmd_hdr.crc |= c << 8;
+                cmd_payload_idx = 0;
+                cmd_state = (cmd_hdr.len > 0 && cmd_hdr.len <= USB_MAX_PAYLOAD) ? 8 : 9;
+                if (cmd_hdr.len > USB_MAX_PAYLOAD) cmd_state = 0;
+                break;
+            case 8:
+                cmd_payload[cmd_payload_idx++] = c;
+                if (cmd_payload_idx >= cmd_hdr.len) cmd_state = 9;
+                break;
+        }
+        if (cmd_state == 9) {
+            cmd_hdr.sync = CMD_SYNC_BYTE;
+            uint16_t calc = USB_CRC16((uint8_t*)&cmd_hdr, 6);
+            if (cmd_hdr.len) calc ^= USB_CRC16(cmd_payload, cmd_hdr.len);
+            if (calc == cmd_hdr.crc) {
+                process_command();
+                processed = true;
+            } else {
+                send_response(RESP_ERR_CHECKSUM, cmd_hdr.seq, NULL, 0);
+            }
+            cmd_state = 0;
+        }
     }
-    usbd_poll(usb_device);    // poll
-  } // until we've reached the end.
-  return;
-} // USPuts
-
-//*  USWriteBlock - Write a block of characters without "cooking"
-//   ------------------------------------------------------------
-//
-//      This is a bit more efficient than single-character writes.
-//
-//      Always returns zero.
-//
-
-int USWriteBlock( uint8_t *What, int Count)
-{
-
-  int 
-    thisPass;
-
-  while ( Count != 0)
-  {
-      thisPass = ( Count >= USB_PACKET_SIZE) ? USB_PACKET_SIZE-1 : Count;
-      
-      while( usbd_ep_write_packet(usb_device, USB_DATA_ENDPOINT_IN, 
-           What, thisPass) == 0)
-        usbd_poll(usb_device);  // poll
-      What += thisPass;         // advance buffer
-      Count -= thisPass;
-  }
-  return 0;
-
-} //  USWriteBlock
+    return processed;
+}

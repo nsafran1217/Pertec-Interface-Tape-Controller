@@ -25,7 +25,7 @@
 #include "globals.h"
 #include "tapedriver.h"
 #include "pertbits.h"
-#include "filedef.h"
+
 
 //  Static variables used here.
 
