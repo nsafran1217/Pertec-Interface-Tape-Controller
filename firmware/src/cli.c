@@ -67,6 +67,8 @@ static const COMMAND_LIST Commands[] =
    "Set stop: # of filemarks or V for EOV ", 	CmdSetStop	},  // tapeutil
  { "DEBUG",	"Set command register [value]",	CmdTapeDebug	},  // tapeutil
 
+ { "TESTSD",	"Test SD write speed",	CmdTestSDCard	},  // tapeutil
+
 // { "SETPE",	"Set 1600 PE mode",		CmdSet1600	},  // tapeutil
 // { "SETGCR",	"Set 6250 GCR mode",		CmdSet6250	},  // tapeutil
  

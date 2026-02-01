@@ -19,4 +19,6 @@ void CmdCreateImage( char *args[]);
 void CmdWriteImage( char *args[]);
 void CmdSet1600( char *args[]);
 void CmdSet6250( char *args[]);
+void CmdTestSDCard (char *args[]);
+int fakeTapeRead(uint8_t *Buf, int Buflen, int *BytesRead, int HowManyBytesToFakee);
 #endif

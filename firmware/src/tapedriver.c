@@ -327,6 +327,7 @@ unsigned int TapeRead( uint8_t *Buf, int Buflen, int *BytesRead)
 
   while( true)
   {
+    Delay(10);
     status = TapeStatus();
     if ( status & PS1_IFBY)
       break;
@@ -340,6 +341,7 @@ unsigned int TapeRead( uint8_t *Buf, int Buflen, int *BytesRead)
   
   do
   {
+    Delay(10);
     status = TapeStatus();
     if ( !(status & PS1_IFBY))
     {

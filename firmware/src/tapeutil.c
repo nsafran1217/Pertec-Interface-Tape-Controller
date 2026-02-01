@@ -496,6 +496,146 @@ void CmdTapeDebug( char *args[])
   return;
 } //  CmdTapeDebug
 
+
+void CmdTestSDCard (char *args[])
+{
+  Uprintf("Testing SD Card\n");
+  FRESULT fres;
+  FIL tf;
+  bool abort;
+
+ 
+  UINT wc;
+  
+  uint32_t readStart, readEnd, writeStart, writeEnd; // debug
+
+  int curBuf = 0;  // current buffer index for double buffering
+  uint8_t *halfBuf[2];
+  halfBuf[0] = TapeBuffer;
+  halfBuf[1] = TapeBuffer + (TAPE_BUFFER_SIZE / 2);
+
+  
+  // Previous block state (for deferred SD write)
+  int prevCount = 0;
+  
+  bool havePrevious = false;
+
+  int BlockSize = 10240*2;
+    
+    if ( !args[0])
+  {
+    Uprintf( "This command requires an image file name!\n");
+    return;
+  }
+
+  if ( (fres = f_open( &tf, args[0], FA_CREATE_ALWAYS | FA_WRITE)) != FR_OK)
+  {
+    Uprintf( "\nError in creating file. Error = %d\n", fres);
+    return;
+  }
+
+  abort = false;
+
+  ShowRTCTime();
+  int writeLoop = 10;
+  while( writeLoop > 0)
+  {
+  
+    if ( (abort = CheckForEscape()) )
+      break;
+
+    // Read forward into current buffer
+    readStart = Milliseconds;
+
+    memset(halfBuf[curBuf], 0x99, BlockSize); // fill buffer with data
+    
+
+    readEnd = Milliseconds;
+
+    // Write previous block while we just finished reading current (single SD write)
+    writeStart = Milliseconds;
+    if (havePrevious)
+    {
+        size_t writeSize = BlockSize;
+        f_write(&tf, halfBuf[curBuf], writeSize, &wc);
+    }
+    writeEnd = Milliseconds;
+
+    DBprintf("Read=%dms ( buf%d), Write=%dms, data=%d\n",
+              
+             readEnd - readStart, curBuf, writeEnd - writeStart, halfBuf[curBuf][0]);
+
+
+    havePrevious = true;
+
+    // Swap buffers
+    curBuf = 1 - curBuf;  
+
+    writeLoop = writeLoop--;
+  } // read the tape
+  
+
+  if ( abort)
+  {
+    Uprintf( "Operation terminated by operator.\n");
+  }
+
+  f_close( &tf);
+
+  ShowRTCTime();
+
+  return;
+}
+
+//*	TapeRead - Read a tape block.
+//	-----------------------------
+//
+//	Reads (forward) a block from a tape into a buffer.
+//	Returns the size of the block read and the status.
+//
+//	Status can be a combination of any of these:
+//		TSTAT_OFFLINE 	- Drive is offline
+//		TSTAT_HARDERR 	- Formatter detected a hard error
+//		TSTAT_CORRERR 	- Formatter corrected an error
+//		TSTAT_TAPEMARK 	- Record is a tape mark
+//		TSTAT_EOT	- End of tape encountered
+//		TSTAT_BLANK	- Blank tape read
+//		TSTAT_LENGTH	- Block longer than buffer
+//		TSTAT_NOERR	- No error detected
+//
+//	Some conditions such as read past EOT, offline, blank or tapemark
+//	return a data count of zero.
+//
+
+int fakeTapeRead(uint8_t *Buf, int Buflen, int *BytesRead, int HowManyBytesToFakee)
+{
+  unsigned int retStatus = 0;
+
+  *BytesRead = 0;
+  Delay(40*1000);
+
+  if (!IsTapeOnline())
+    return TSTAT_OFFLINE;
+
+  if (HowManyBytesToFakee == 0)
+  {
+    *BytesRead = 0;
+    return TSTAT_TAPEMARK;
+  }
+
+
+  if (HowManyBytesToFakee > Buflen)
+  {
+    retStatus |= TSTAT_LENGTH; /* buffer too small for requested blocks */
+  }
+
+  for (long i = 0; i < HowManyBytesToFakee; i++)
+    Buf[i] = (uint8_t)(i & 0xFF);
+
+  *BytesRead = (int)HowManyBytesToFakee;
+  return retStatus; /* zero is TSTAT_NOERR */
+}
+
 //*	CmdCreateImage - Read tape and write an image file.
 //	------------------------------------------------
 //
@@ -520,7 +660,7 @@ void CmdCreateImage( char *args[])
   halfBuf[1] = TapeBuffer + (TAPE_BUFFER_SIZE / 2);
 
   /* Temporary buffer to assemble header + data + trailer for single f_write */
-  uint8_t writeBuf[(TAPE_BUFFER_SIZE / 2) + (sizeof(uint32_t) * 2)];
+ // uint8_t writeBuf[(TAPE_BUFFER_SIZE / 2) + (sizeof(uint32_t) * 2)];
 
   // Previous block state (for deferred SD write)
   int prevCount = 0;
@@ -564,32 +704,44 @@ void CmdCreateImage( char *args[])
 
   ShowRTCTime();
   
+
+  int BlockSizeToRead = 10240*2;
   while( true)
   {
+
+    
     unsigned int readStat;
     int readCount;
      
     if ( (abort = CheckForEscape()) )
       break;
+    if (TapePosition > 100){
+      BlockSizeToRead = 0;
+    }
+    
 
     // Read forward into current buffer
     readStart = Milliseconds;
-    readStat = TapeRead( halfBuf[curBuf], TAPE_BUFFER_SIZE / 2, &readCount);
+    readStat = fakeTapeRead( halfBuf[curBuf], TAPE_BUFFER_SIZE / 2, &readCount, BlockSizeToRead);
     readEnd = Milliseconds;
 
     // Write previous block while we just finished reading current (single SD write)
     writeStart = Milliseconds;
     if (havePrevious)
     {
-      size_t writeSize = sizeof(prevHeader);
-      memcpy(writeBuf, &prevHeader, sizeof(prevHeader));
+      f_write(&tf, &prevHeader, sizeof(prevHeader), &wc);
+      //size_t writeSize = sizeof(prevHeader);
+     // memcpy(writeBuf, &prevHeader, sizeof(prevHeader));
       if (prevCount > 0)
       {
-        writeSize += prevCount + sizeof(prevHeader);
-        memcpy(writeBuf + sizeof(prevHeader), halfBuf[1 - curBuf], prevCount);
-        memcpy(writeBuf + sizeof(prevHeader) + prevCount, &prevHeader, sizeof(prevHeader));
+        //writeSize += prevCount + sizeof(prevHeader);
+   //     memcpy(writeBuf + sizeof(prevHeader), halfBuf[1 - curBuf], prevCount);
+ //       memcpy(writeBuf + sizeof(prevHeader) + prevCount, &prevHeader, sizeof(prevHeader));
+
+        f_write(&tf, halfBuf[1 - curBuf], prevCount, &wc);
+        f_write(&tf, &prevHeader, sizeof(prevHeader), &wc);
       }
-      f_write(&tf, writeBuf, writeSize, &wc);
+      //f_write(&tf, writeBuf, writeSize, &wc);
       AddRecordCount(prevCount);
     }
     writeEnd = Milliseconds;
@@ -682,12 +834,12 @@ void CmdCreateImage( char *args[])
   writeStart = Milliseconds;
   if (havePrevious)
   {
-    size_t writeSize = sizeof(prevHeader) + prevCount + sizeof(prevHeader);
-    memcpy(writeBuf, &prevHeader, sizeof(prevHeader));
-    if (prevCount > 0)
-      memcpy(writeBuf + sizeof(prevHeader), halfBuf[1 - curBuf], prevCount);
-    memcpy(writeBuf + sizeof(prevHeader) + prevCount, &prevHeader, sizeof(prevHeader));
-    f_write(&tf, writeBuf, writeSize, &wc);
+    f_write(&tf, &prevHeader, sizeof(prevHeader), &wc);
+        if (prevCount > 0)
+    {
+      f_write(&tf, halfBuf[1 - curBuf], prevCount, &wc);
+      f_write(&tf, &prevHeader, sizeof(prevHeader), &wc);
+    }
     AddRecordCount(prevCount);
   }
   writeEnd = Milliseconds;
