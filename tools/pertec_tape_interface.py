@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """
-STM32 PERTEC Tape Interface - Host Application
-Replicates the CLI tape utility functionality over USB
+PERTEC Tape Interface - Host Application
+
+Sends commands to MCU and streams TAP file data.
+The MCU handles TAP file assembly/parsing.
 """
 
 import struct
@@ -10,93 +12,44 @@ import sys
 import os
 import serial
 import serial.tools.list_ports
-from dataclasses import dataclass
-from enum import IntEnum
-from typing import Optional, Tuple, Callable
+from typing import Optional, BinaryIO
 
-# TAP file format constants
-TAP_ERROR_FLAG = 0x80000000
-TAP_LENGTH_MASK = 0x00FFFFFF
-TAP_EOM = 0xFFFFFFFF
+# Framing constants
+FRAME_START = 0xAA
+FRAME_END   = 0x55
+FRAME_ESC   = 0x1B
 
-# Protocol constants
-CMD_SYNC, RESP_SYNC = 0xAA, 0x55
-MAX_PAYLOAD = 4096
+# Command codes
+CMD_NOP          = 0x00
+CMD_STATUS       = 0x01
+CMD_REWIND       = 0x02
+CMD_UNLOAD       = 0x03
+CMD_SKIP         = 0x04
+CMD_SPACE        = 0x05
+CMD_READ_BLOCK   = 0x06
+CMD_SET_DENSITY  = 0x07
+CMD_CREATE_IMAGE = 0x10
+CMD_WRITE_IMAGE  = 0x11
+CMD_ABORT        = 0xFF
 
-class Cmd(IntEnum):
-    NOP=0x00; GET_INFO=0x01; GET_STATUS=0x02; RESET=0x03
-    SET_CONFIG=0x10; GET_CONFIG=0x11; SET_DENSITY=0x12; SET_ADDRESS=0x13
-    REWIND=0x20; UNLOAD=0x21; SKIP_BLOCK=0x22; SKIP_FILE=0x23
-    READ_BLOCK=0x30; WRITE_BLOCK=0x31; WRITE_FILEMARK=0x32
-    DEBUG_INFO=0xF0
+# Response codes
+RESP_OK        = 0x00
+RESP_ERR       = 0x01
+RESP_BUSY      = 0x02
+RESP_DATA      = 0x10
+RESP_DONE      = 0x20
+RESP_NEED_DATA = 0x30
 
-class Resp(IntEnum):
-    OK=0x00; ERR_UNKNOWN=0x01; ERR_CMD=0x02; ERR_PARAM=0x03
-    ERR_OFFLINE=0x04; ERR_TIMEOUT=0x05; ERR_PROTECTED=0x06; ERR_CHECKSUM=0x07
-    TAPEMARK=0x10; EOT=0x11; LOADPOINT=0x12; HARDERR=0x13
-    CORRERR=0x14; BLANK=0x15; LENGTH=0x16; DATA=0x80
-
-@dataclass
-class DeviceInfo:
-    protocol_ver: int; fw_major: int; fw_minor: int; fw_patch: int
-    capabilities: int; max_payload: int; buffer_size: int
-
-@dataclass
-class TapeStatus:
-    raw: int; online: bool; ready: bool; loadpoint: bool; eot: bool
-    protected: bool; rewinding: bool; filemark: bool; error: bool; position: int
-    
-    def __str__(self):
-        flags = []
-        if self.online: flags.append("Online")
-        if self.ready: flags.append("Ready")
-        if self.loadpoint: flags.append("Load point")
-        if self.eot: flags.append("EOT")
-        if self.protected: flags.append("Protected")
-        if self.rewinding: flags.append("Rewinding")
-        return f"Status: {' '.join(flags) or 'Offline'} (pos={self.position})"
-
-@dataclass
-class Config:
-    retries: int; stop_tapemarks: int; stop_on_error: bool
-    density: int; tape_address: int; timeout_ms: int
 
 class TapeError(Exception):
-    def __init__(self, code: int, msg: str = ""):
-        self.code = code
-        super().__init__(msg or self._translate(code))
-    
-    @staticmethod
-    def _translate(code):
-        return {
-            Resp.ERR_OFFLINE: "Drive is offline",
-            Resp.ERR_PROTECTED: "Write protected",
-            Resp.HARDERR: "Unrecoverable data error",
-            Resp.CORRERR: "Corrected data error", 
-            Resp.TAPEMARK: "Tape mark hit",
-            Resp.EOT: "End of tape",
-            Resp.BLANK: "Blank tape",
-            Resp.LENGTH: "Buffer overrun",
-        }.get(code, f"Error 0x{code:02X}")
+    pass
 
-def crc16(data: bytes) -> int:
-    crc = 0xFFFF
-    for b in data:
-        crc = ((crc >> 8) | (crc << 8)) & 0xFFFF
-        crc ^= b
-        crc ^= (crc & 0xFF) >> 4
-        crc ^= (crc << 12) & 0xFFFF
-        crc ^= ((crc & 0xFF) << 5) & 0xFFFF
-    return crc
 
 class TapeInterface:
-    """USB interface to STM32 tape controller"""
-    
     def __init__(self, port: str = None, timeout: float = 10.0):
         self.port = port
         self.timeout = timeout
         self.ser: Optional[serial.Serial] = None
-        self._seq = 0
     
     @staticmethod
     def find_device() -> Optional[str]:
@@ -112,7 +65,7 @@ class TapeInterface:
         if self.port is None:
             self.port = self.find_device()
         if not self.port:
-            raise TapeError(0, "Device not found")
+            raise TapeError("Device not found")
         self.ser = serial.Serial(self.port, 115200, timeout=self.timeout)
         time.sleep(0.1)
         self.ser.reset_input_buffer()
@@ -122,339 +75,254 @@ class TapeInterface:
             self.ser.close()
             self.ser = None
     
-    def __enter__(self): self.open(); return self
-    def __exit__(self, *a): self.close()
+    def __enter__(self):
+        self.open()
+        return self
     
-    def _send(self, cmd: Cmd, payload: bytes = b'') -> Tuple[int, bytes]:
-        if not self.ser:
-            raise TapeError(0, "Not connected")
-        self._seq = (self._seq + 1) & 0xFFFF
-        hdr = struct.pack('<BBHH', CMD_SYNC, cmd, self._seq, len(payload))
-        crc = crc16(hdr) ^ (crc16(payload) if payload else 0)
-        self.ser.write(hdr + struct.pack('<H', crc) + payload)
+    def __exit__(self, *a):
+        self.close()
+    
+    def _escape_data(self, data: bytes) -> bytes:
+        """Escape special bytes in data"""
+        result = bytearray()
+        for b in data:
+            if b in (FRAME_START, FRAME_END, FRAME_ESC):
+                result.append(FRAME_ESC)
+                result.append(b ^ 0x20)
+            else:
+                result.append(b)
+        return bytes(result)
+    
+    def _unescape_data(self, data: bytes) -> bytes:
+        """Unescape data"""
+        result = bytearray()
+        i = 0
+        while i < len(data):
+            if data[i] == FRAME_ESC and i + 1 < len(data):
+                result.append(data[i + 1] ^ 0x20)
+                i += 2
+            else:
+                result.append(data[i])
+                i += 1
+        return bytes(result)
+    
+    def _send_packet(self, ptype: int, data: bytes = b''):
+        """Send a framed packet"""
+        escaped = self._escape_data(data)
+        pkt = bytes([FRAME_START, ptype, len(data) & 0xFF, (len(data) >> 8) & 0xFF])
+        pkt += escaped
+        pkt += bytes([FRAME_END])
+        self.ser.write(pkt)
+    
+    def _recv_packet(self, timeout: float = None) -> tuple:
+        """Receive a framed packet. Returns (type, data) or (None, None) on timeout"""
+        if timeout:
+            old_timeout = self.ser.timeout
+            self.ser.timeout = timeout
         
-        # Read response header - may need multiple reads for large responses
-        rhdr = b''
-        while len(rhdr) < 8:
-            chunk = self.ser.read(8 - len(rhdr))
-            if not chunk:
-                raise TapeError(0, f"Timeout reading header (got {len(rhdr)} bytes)")
-            rhdr += chunk
-        
-        sync, status, seq, length, rcrc = struct.unpack('<BBHHH', rhdr)
-        if sync != RESP_SYNC:
-            # Try to resync - flush input and report error
-            self.ser.reset_input_buffer()
-            raise TapeError(0, f"Bad sync: 0x{sync:02X} (expected 0x{RESP_SYNC:02X})")
-        if seq != self._seq:
-            raise TapeError(0, f"Seq mismatch: expected {self._seq}, got {seq}")
-        
-        # Read payload - may need multiple reads for large blocks
-        data = b''
-        remaining = length
-        while remaining > 0:
-            chunk = self.ser.read(min(remaining, 4096))
-            if not chunk:
-                raise TapeError(0, f"Timeout reading payload (got {len(data)}/{length} bytes)")
-            data += chunk
-            remaining -= len(chunk)
-        
-        calc = crc16(rhdr[:6]) ^ (crc16(data) if data else 0)
-        if calc != rcrc:
-            raise TapeError(0, f"CRC error: expected 0x{rcrc:04X}, got 0x{calc:04X}")
-        return status, data
+        try:
+            # Wait for start byte
+            while True:
+                b = self.ser.read(1)
+                if not b:
+                    return (None, None)
+                if b[0] == FRAME_START:
+                    break
+            
+            # Read type and length
+            hdr = self.ser.read(3)
+            if len(hdr) < 3:
+                return (None, None)
+            
+            ptype = hdr[0]
+            length = hdr[1] | (hdr[2] << 8)
+            
+            # Read data until END (accounting for escapes)
+            data = bytearray()
+            while True:
+                b = self.ser.read(1)
+                if not b:
+                    return (None, None)
+                if b[0] == FRAME_END:
+                    break
+                data.append(b[0])
+            
+            return (ptype, self._unescape_data(bytes(data)))
+        finally:
+            if timeout:
+                self.ser.timeout = old_timeout
+    
+    def _send_command(self, cmd: int, params: bytes = b'') -> tuple:
+        """Send command and wait for response"""
+        self._send_packet(cmd, params)
+        return self._recv_packet()
     
     def ping(self) -> bool:
-        return self._send(Cmd.NOP)[0] == Resp.OK
+        rtype, _ = self._send_command(CMD_NOP)
+        return rtype == RESP_OK
     
-    def get_info(self) -> DeviceInfo:
-        _, d = self._send(Cmd.GET_INFO)
-        v = struct.unpack('<BBBBIHHH', d[:14])
-        return DeviceInfo(*v[:7])
-    
-    def get_status(self) -> TapeStatus:
-        _, d = self._send(Cmd.GET_STATUS)
-        raw, ol, rdy, lp, eot, prot, rwd, fm, err, pos = struct.unpack('<HBBBBBBBBL', d[:14])
-        return TapeStatus(raw, bool(ol), bool(rdy), bool(lp), bool(eot),
-                          bool(prot), bool(rwd), bool(fm), bool(err), pos)
-    
-    def get_config(self) -> Config:
-        _, d = self._send(Cmd.GET_CONFIG)
-        ret, stop, err, dens, addr, tmo = struct.unpack('<BBBBHH', d[:8])
-        return Config(ret, stop, bool(err), dens, addr, tmo)
-    
-    def set_config(self, cfg: Config):
-        payload = struct.pack('<BBBBHH', cfg.retries, cfg.stop_tapemarks,
-                              1 if cfg.stop_on_error else 0, cfg.density,
-                              cfg.tape_address, cfg.timeout_ms)
-        st, _ = self._send(Cmd.SET_CONFIG, payload)
-        if st != Resp.OK:
-            raise TapeError(st)
-    
-    def set_density(self, density: int):
-        """Set density: 1=1600 PE, 2=6250 GCR (must be at BOT)"""
-        st, _ = self._send(Cmd.SET_DENSITY, bytes([density]))
-        if st != Resp.OK:
-            raise TapeError(st)
-    
-    def rewind(self):
-        st, _ = self._send(Cmd.REWIND)
-        if st != Resp.OK:
-            raise TapeError(st)
-    
-    def unload(self):
-        st, _ = self._send(Cmd.UNLOAD)
-        if st != Resp.OK:
-            raise TapeError(st)
-    
-    def skip_block(self, count: int = 1):
-        """Skip blocks (negative = reverse)"""
-        st, _ = self._send(Cmd.SKIP_BLOCK, struct.pack('<h', count))
-        if st not in (Resp.OK, Resp.TAPEMARK, Resp.LOADPOINT):
-            raise TapeError(st)
-        return st
-    
-    def skip_file(self, count: int = 1):
-        """Skip files (negative = reverse)"""
-        st, _ = self._send(Cmd.SKIP_FILE, struct.pack('<h', count))
-        if st not in (Resp.OK, Resp.EOT, Resp.LOADPOINT):
-            raise TapeError(st)
-        return st
-    
-    def read_block(self) -> Tuple[bytes, int]:
-        """Read one block. Returns (data, flags) where flags: 1=corrected, 2=hard error, 4=truncated"""
-        st, d = self._send(Cmd.READ_BLOCK)
-        if st == Resp.TAPEMARK:
-            return b'', 0
-        if st in (Resp.DATA, Resp.OK, Resp.LENGTH, Resp.CORRERR, Resp.HARDERR):
-            # All these can contain valid data
-            if len(d) < 5:
-                raise TapeError(0, f"Short response: {len(d)} bytes")
-            length, flags = struct.unpack('<IB', d[:5])
-            # LENGTH response means block was truncated
-            if st == Resp.LENGTH:
-                flags |= 0x04
-            return d[5:5+length], flags
-        if st in (Resp.BLANK, Resp.EOT):
-            raise TapeError(st)
-        raise TapeError(st)
-    
-    def write_block(self, data: bytes):
-        """Write one block"""
-        st, _ = self._send(Cmd.WRITE_BLOCK, data)
-        if st != Resp.OK:
-            raise TapeError(st)
-    
-    def write_filemark(self):
-        """Write a tape mark"""
-        st, _ = self._send(Cmd.WRITE_FILEMARK)
-        if st != Resp.OK:
-            raise TapeError(st)
-    
-    def debug_info(self) -> dict:
-        """Get debug information from device"""
-        _, d = self._send(Cmd.DEBUG_INFO)
-        if len(d) < 22:
-            return {'error': 'short response'}
-        vals = struct.unpack('<HHHHHHIII', d[:22])
+    def get_status(self) -> dict:
+        rtype, data = self._send_command(CMD_STATUS)
+        if rtype != RESP_OK or len(data) < 14:
+            return {'error': True}
+        
+        raw, pos, copied, online, ready, lp, eot, prot, rwd = struct.unpack('<HIIBBBBB', data[:14])
         return {
-            'tape_buffer_size': vals[0],
-            'usb_max_payload': vals[1],
-            'tx_buf_size': vals[2],
-            'rx_buf_size': vals[3],
-            'tx_used': vals[4],
-            'rx_used': vals[5],
-            'position': vals[6],
-            'bytes_transferred': vals[7],
-            'errors': vals[8]
+            'raw_status': raw,
+            'position': pos,
+            'bytes_copied': copied,
+            'online': bool(online),
+            'ready': bool(ready),
+            'loadpoint': bool(lp),
+            'eot': bool(eot),
+            'protected': bool(prot),
+            'rewinding': bool(rwd),
         }
     
-    # High-level operations matching tapeutil.c
+    def rewind(self):
+        rtype, _ = self._send_command(CMD_REWIND)
+        if rtype != RESP_OK:
+            raise TapeError("Rewind failed")
     
-    def create_image(self, filename: str, no_rewind: bool = False,
-                     stop_tapemarks: int = 2, stop_on_error: bool = False,
-                     stop_on_eov: bool = False,
-                     progress: Callable = None) -> dict:
-        """Read tape to TAP image file (CmdCreateImage equivalent)"""
-        stats = {'blocks': 0, 'files': 0, 'bytes': 0, 'errors': 0}
+    def unload(self):
+        rtype, _ = self._send_command(CMD_UNLOAD)
+        if rtype != RESP_OK:
+            raise TapeError("Unload failed")
+    
+    def skip(self, count: int):
+        params = struct.pack('<h', count)
+        rtype, _ = self._send_command(CMD_SKIP, params)
+        if rtype != RESP_OK:
+            raise TapeError("Skip failed")
+    
+    def space(self, count: int):
+        params = struct.pack('<h', count)
+        rtype, _ = self._send_command(CMD_SPACE, params)
+        if rtype != RESP_OK:
+            raise TapeError("Space failed")
+    
+    def set_density(self, density: int):
+        """Set density: 1=1600, 2=6250"""
+        rtype, _ = self._send_command(CMD_SET_DENSITY, bytes([density]))
+        if rtype != RESP_OK:
+            raise TapeError("Set density failed (must be at BOT)")
+    
+    def read_block(self) -> tuple:
+        """Read single block. Returns (status, data)"""
+        rtype, hdr = self._send_command(CMD_READ_BLOCK)
+        if rtype != RESP_DATA or len(hdr) < 6:
+            raise TapeError("Read block failed")
         
-        if not self.get_status().online:
-            raise TapeError(Resp.ERR_OFFLINE)
+        status = hdr[0] | (hdr[1] << 8)
+        length = hdr[2] | (hdr[3] << 8) | (hdr[4] << 16) | (hdr[5] << 24)
         
-        if not no_rewind:
-            self.rewind()
+        # Read the data packet
+        if length > 0:
+            rtype, data = self._recv_packet()
+            if rtype is None:
+                raise TapeError("Timeout reading block data")
+            return (status, data[:length])
         
-        consecutive_marks = 0
-        EOV_ASCII = b'EOV'
-        EOV_EBCDIC = bytes([0xC5, 0xD6, 0xE5])
+        return (status, b'')
+    
+    def create_image(self, filename: str, stop_tapemarks: int = 2,
+                     stop_on_error: bool = False, no_rewind: bool = False,
+                     progress=None) -> dict:
+        """Read tape and save TAP image to file"""
+        stats = {'blocks': 0, 'bytes': 0}
         
+        # Send create_image command
+        params = bytes([
+            stop_tapemarks if stop_tapemarks != 'V' else ord('V'),
+            1 if stop_on_error else 0,
+            1 if no_rewind else 0
+        ])
+        self._send_packet(CMD_CREATE_IMAGE, params)
+        
+        # Wait for OK response (transfer starting)
+        rtype, data = self._recv_packet()
+        if rtype != RESP_OK:
+            raise TapeError("Create image failed to start")
+        
+        # Open output file
         with open(filename, 'wb') as f:
+            # Receive data packets until DONE
             while True:
-                try:
-                    data, flags = self.read_block()
-                except TapeError as e:
-                    if e.code == Resp.TAPEMARK:
-                        # Write tapemark to file
-                        f.write(struct.pack('<I', 0))
-                        consecutive_marks += 1
-                        stats['files'] += 1
-                        if progress:
-                            progress(stats, f"Tapemark at block {stats['blocks']}")
-                        if consecutive_marks >= stop_tapemarks:
-                            stats['files'] -= (stop_tapemarks - 1)
-                            break
-                        continue
-                    elif e.code in (Resp.BLANK, Resp.EOT):
-                        if progress:
-                            progress(stats, "Blank tape or EOT hit")
-                        break
-                    elif e.code == Resp.HARDERR:
-                        stats['errors'] += 1
-                        if stop_on_error:
-                            if progress:
-                                progress(stats, "Stopping at error")
-                            break
-                        continue
-                    else:
-                        raise
+                rtype, data = self._recv_packet(timeout=30.0)
                 
-                consecutive_marks = 0
+                if rtype is None:
+                    raise TapeError("Timeout waiting for data")
                 
-                # Check for EOV stop condition
-                if stop_on_eov and len(data) >= 3:
-                    if data[:3] == EOV_ASCII or data[:3] == EOV_EBCDIC:
-                        if progress:
-                            progress(stats, "Hit EOV--ending")
-                        # Still write this record
-                        header = len(data)
-                        f.write(struct.pack('<I', header))
-                        f.write(data)
-                        f.write(struct.pack('<I', header))
-                        stats['blocks'] += 1
-                        stats['bytes'] += len(data)
-                        break
+                if rtype == RESP_DONE:
+                    break
                 
-                # Build TAP header
-                header = len(data)
-                if flags & 0x02:  # Hard error
-                    header |= TAP_ERROR_FLAG
-                    stats['errors'] += 1
-                if flags & 0x04:  # Block truncated (length error)
-                    header |= TAP_ERROR_FLAG
-                    if progress:
-                        progress(stats, f"Block too long at {stats['blocks']}; truncated")
-                if flags & 0x01:  # Corrected error
-                    if progress:
-                        progress(stats, f"Corrected error at block {stats['blocks']}")
-                
-                # Write record
-                f.write(struct.pack('<I', header))
-                if data:
+                if rtype == RESP_DATA:
                     f.write(data)
-                    f.write(struct.pack('<I', header))
+                    stats['bytes'] += len(data)
+                    stats['blocks'] += 1
+                    if progress:
+                        progress(stats)
                 
-                stats['blocks'] += 1
-                stats['bytes'] += len(data)
-                
-                if progress:
-                    progress(stats, None)
-            
-            # Write EOM marker
-            f.write(struct.pack('<I', TAP_EOM))
-        
-        if not no_rewind:
-            self.rewind()
+                elif rtype == RESP_ERR:
+                    raise TapeError("Error during read")
         
         return stats
     
     def write_image(self, filename: str, no_rewind: bool = False,
-                    progress: Callable = None) -> dict:
-        """Write TAP image file to tape (CmdWriteImage equivalent)"""
-        stats = {'blocks': 0, 'files': 0, 'bytes': 0}
+                    progress=None) -> dict:
+        """Write TAP image file to tape"""
+        stats = {'blocks': 0, 'bytes': 0}
         
-        status = self.get_status()
-        if not status.online:
-            raise TapeError(Resp.ERR_OFFLINE)
-        if status.protected:
-            raise TapeError(Resp.ERR_PROTECTED)
+        # Check file exists
+        if not os.path.exists(filename):
+            raise TapeError(f"File not found: {filename}")
         
-        if not no_rewind:
-            self.rewind()
+        file_size = os.path.getsize(filename)
         
+        # Send write_image command
+        params = bytes([1 if no_rewind else 0])
+        self._send_packet(CMD_WRITE_IMAGE, params)
+        
+        # Wait for OK response (ready for data)
+        rtype, data = self._recv_packet()
+        if rtype != RESP_OK:
+            raise TapeError("Write image failed to start")
+        
+        # Open and send file
         with open(filename, 'rb') as f:
             while True:
-                hdr_data = f.read(4)
-                if len(hdr_data) < 4:
+                # Wait for data request
+                rtype, req = self._recv_packet(timeout=30.0)
+                
+                if rtype is None:
+                    raise TapeError("Timeout waiting for data request")
+                
+                if rtype == RESP_DONE:
                     break
                 
-                header = struct.unpack('<I', hdr_data)[0]
+                if rtype == RESP_ERR:
+                    raise TapeError("Error during write")
                 
-                if header == TAP_EOM:
-                    break
-                
-                if header == 0:
-                    # Tapemark
-                    self.write_filemark()
-                    stats['files'] += 1
-                    if progress:
-                        progress(stats, "Wrote tapemark")
-                    continue
-                
-                length = header & TAP_LENGTH_MASK
-                if length > MAX_PAYLOAD:
-                    raise TapeError(0, f"Block too large at {stats['blocks']}")
-                
-                data = f.read(length)
-                if len(data) < length:
-                    raise TapeError(0, f"File truncated at block {stats['blocks']}")
-                
-                trailer = struct.unpack('<I', f.read(4))[0]
-                if trailer != header:
-                    raise TapeError(0, f"Corrupt TAP file at block {stats['blocks']}")
-                
-                self.write_block(data)
-                stats['blocks'] += 1
-                stats['bytes'] += length
-                
-                if progress:
-                    progress(stats, None)
-        
-        if not no_rewind:
-            self.rewind()
+                if rtype == RESP_NEED_DATA:
+                    # MCU is requesting data
+                    req_len = req[0] | (req[1] << 8) | (req[2] << 16) | (req[3] << 24) if len(req) >= 4 else 4096
+                    
+                    chunk = f.read(min(req_len, 2048))
+                    if chunk:
+                        self._send_packet(RESP_DATA, chunk)
+                        stats['bytes'] += len(chunk)
+                        stats['blocks'] += 1
+                        if progress:
+                            progress(stats, file_size)
+                    else:
+                        # End of file
+                        self._send_packet(RESP_DONE)
         
         return stats
-
-
-def show_buffer(data: bytes, max_display: int = 256, ebcdic: bool = False):
-    """Display buffer contents (hex + ASCII/EBCDIC)"""
-    EBCDIC_TO_ASCII = bytes([
-        0x00,0x01,0x02,0x03,0x1A,0x09,0x1A,0x7F,0x1A,0x1A,0x1A,0x0B,0x0C,0x0D,0x0E,0x0F,
-        0x10,0x11,0x12,0x13,0x1A,0x0A,0x08,0x1A,0x18,0x19,0x1A,0x1A,0x1C,0x1D,0x1E,0x1F,
-        0x1A,0x1A,0x1C,0x1A,0x1A,0x0A,0x17,0x1B,0x1A,0x1A,0x1A,0x1A,0x1A,0x05,0x06,0x07,
-        0x1A,0x1A,0x16,0x1A,0x1A,0x1E,0x1A,0x04,0x1A,0x1A,0x1A,0x1A,0x14,0x15,0x1A,0x1A,
-        0x20,0x1A,0x1A,0x1A,0x1A,0x1A,0x1A,0x1A,0x1A,0x1A,0x1A,0x2E,0x3C,0x28,0x2B,0x7C,
-        0x26,0x1A,0x1A,0x1A,0x1A,0x1A,0x1A,0x1A,0x1A,0x1A,0x21,0x24,0x2A,0x29,0x3B,0x5E,
-        0x2D,0x2F,0x1A,0x1A,0x1A,0x1A,0x1A,0x1A,0x1A,0x1A,0x1A,0x2C,0x25,0x5F,0x3E,0x3F,
-        0x1A,0x1A,0x1A,0x1A,0x1A,0x1A,0x1A,0x1A,0x1A,0x60,0x3A,0x23,0x40,0x27,0x3D,0x22,
-        0x1A,0x61,0x62,0x63,0x64,0x65,0x66,0x67,0x68,0x69,0x1A,0x1A,0x1A,0x1A,0x1A,0x1A,
-        0x1A,0x6A,0x6B,0x6C,0x6D,0x6E,0x6F,0x70,0x71,0x72,0x1A,0x1A,0x1A,0x1A,0x1A,0x1A,
-        0x1A,0x7E,0x73,0x74,0x75,0x76,0x77,0x78,0x79,0x7A,0x1A,0x1A,0x1A,0x5B,0x1A,0x1A,
-        0x1A,0x1A,0x1A,0x1A,0x1A,0x1A,0x1A,0x1A,0x1A,0x1A,0x1A,0x1A,0x1A,0x5D,0x1A,0x1A,
-        0x7B,0x41,0x42,0x43,0x44,0x45,0x46,0x47,0x48,0x49,0x1A,0x1A,0x1A,0x1A,0x1A,0x1A,
-        0x7D,0x4A,0x4B,0x4C,0x4D,0x4E,0x4F,0x50,0x51,0x52,0x1A,0x1A,0x1A,0x1A,0x1A,0x1A,
-        0x5C,0x1A,0x53,0x54,0x55,0x56,0x57,0x58,0x59,0x5A,0x1A,0x1A,0x1A,0x1A,0x1A,0x1A,
-        0x30,0x31,0x32,0x33,0x34,0x35,0x36,0x37,0x38,0x39,0x1A,0x1A,0x1A,0x1A,0x1A,0x1A,
-    ])
     
-    display = data[:max_display]
-    for i in range(0, len(display), 16):
-        chunk = display[i:i+16]
-        hexpart = ' '.join(f'{b:02X}' for b in chunk)
-        if ebcdic:
-            ascpart = ''.join(chr(EBCDIC_TO_ASCII[b]) if 32 <= EBCDIC_TO_ASCII[b] < 127 else '.' for b in chunk)
-        else:
-            ascpart = ''.join(chr(b) if 32 <= b < 127 else '.' for b in chunk)
-        print(f'{i:04X}: {hexpart:<48} {ascpart}')
+    def abort(self):
+        """Send abort command"""
+        self._send_packet(CMD_ABORT)
 
 
 def main():
@@ -463,83 +331,68 @@ def main():
     parser = argparse.ArgumentParser(description='PERTEC Tape Interface')
     parser.add_argument('-p', '--port', help='Serial port')
     parser.add_argument('-v', '--verbose', action='store_true')
-    parser.add_argument('-d', '--debug', action='store_true', help='Debug mode')
-    parser.add_argument('-t', '--timeout', type=float, default=10.0, help='Timeout in seconds')
     
     sub = parser.add_subparsers(dest='cmd')
     sub.add_parser('ping', help='Test connection')
-    sub.add_parser('info', help='Device info')
     sub.add_parser('status', help='Tape status')
     sub.add_parser('rewind', help='Rewind tape')
     sub.add_parser('unload', help='Unload tape')
-    sub.add_parser('debug', help='Show debug info')
-    
-    p = sub.add_parser('read', help='Read and display block')
-    p.add_argument('-e', '--ebcdic', action='store_true', help='EBCDIC display')
     
     p = sub.add_parser('skip', help='Skip blocks')
     p.add_argument('count', type=int, nargs='?', default=1)
     
-    p = sub.add_parser('space', help='Skip files')
+    p = sub.add_parser('space', help='Space files')
     p.add_argument('count', type=int, nargs='?', default=1)
     
     p = sub.add_parser('density', help='Set density')
     p.add_argument('mode', choices=['1600', '6250'])
     
-    p = sub.add_parser('config', help='Show/set config')
-    p.add_argument('--retries', type=int)
-    p.add_argument('--stop', type=int, help='Stop after N tapemarks')
-    p.add_argument('--stop-error', action='store_true')
+    p = sub.add_parser('read', help='Read and display one block')
     
-    p = sub.add_parser('create', help='Read tape to image file')
-    p.add_argument('filename', help='Output TAP file')
+    p = sub.add_parser('create', help='Read tape to TAP file')
+    p.add_argument('filename', help='Output filename')
     p.add_argument('-n', '--no-rewind', action='store_true')
     p.add_argument('-s', '--stop', type=int, default=2, help='Stop after N tapemarks')
     p.add_argument('-e', '--stop-error', action='store_true')
     p.add_argument('-V', '--stop-eov', action='store_true', help='Stop on EOV label')
     
-    p = sub.add_parser('write', help='Write image file to tape')
-    p.add_argument('filename', help='Input TAP file')
+    p = sub.add_parser('write', help='Write TAP file to tape')
+    p.add_argument('filename', help='Input filename')
     p.add_argument('-n', '--no-rewind', action='store_true')
     
     args = parser.parse_args()
+    
     if not args.cmd:
         parser.print_help()
         return
     
-    def progress(stats, msg):
-        if msg:
-            print(f"\r{msg:<60}")
-        else:
-            print(f"\rBlocks: {stats['blocks']:6d}  Files: {stats['files']:3d}  "
-                  f"Bytes: {stats['bytes']:10d}", end='', flush=True)
+    def progress_read(stats):
+        print(f"\rBlocks: {stats['blocks']:6d}  Bytes: {stats['bytes']:10d}", end='', flush=True)
+    
+    def progress_write(stats, total):
+        pct = stats['bytes'] * 100 // total if total else 0
+        print(f"\rProgress: {pct}%  Bytes: {stats['bytes']:10d}", end='', flush=True)
     
     try:
-        with TapeInterface(args.port, timeout=args.timeout) as dev:
-            if args.debug:
-                print(f"Connected to {dev.port}")
-            
+        with TapeInterface(args.port) as dev:
             if args.cmd == 'ping':
                 print("OK" if dev.ping() else "FAIL")
             
-            elif args.cmd == 'info':
-                i = dev.get_info()
-                print(f"Firmware: v{i.fw_major}.{i.fw_minor}.{i.fw_patch}")
-                print(f"Protocol: v{i.protocol_ver}")
-                print(f"Max payload: {i.max_payload}, Buffer: {i.buffer_size}")
-            
             elif args.cmd == 'status':
-                print(dev.get_status())
-            
-            elif args.cmd == 'debug':
-                d = dev.debug_info()
-                print(f"Tape buffer size: {d['tape_buffer_size']}")
-                print(f"USB max payload:  {d['usb_max_payload']}")
-                print(f"TX buffer size:   {d['tx_buf_size']} (used: {d['tx_used']})")
-                print(f"RX buffer size:   {d['rx_buf_size']} (used: {d['rx_used']})")
-                print(f"Position:         {d['position']}")
-                print(f"Bytes transferred:{d['bytes_transferred']}")
-                print(f"Errors:           {d['errors']}")
+                st = dev.get_status()
+                if st.get('error'):
+                    print("Error getting status")
+                else:
+                    flags = []
+                    if st['online']: flags.append("Online")
+                    if st['ready']: flags.append("Ready")
+                    if st['loadpoint']: flags.append("LoadPoint")
+                    if st['eot']: flags.append("EOT")
+                    if st['protected']: flags.append("Protected")
+                    if st['rewinding']: flags.append("Rewinding")
+                    print(f"Status: {' '.join(flags) or 'Offline'}")
+                    print(f"Position: {st['position']}")
+                    print(f"Raw: 0x{st['raw_status']:04X}")
             
             elif args.cmd == 'rewind':
                 dev.rewind()
@@ -549,70 +402,48 @@ def main():
                 dev.unload()
                 print("Unloaded")
             
-            elif args.cmd == 'read':
-                try:
-                    data, flags = dev.read_block()
-                    st = dev.get_status()
-                    print(f"{len(data)} bytes in block {st.position}:")
-                    if data:
-                        show_buffer(data, ebcdic=args.ebcdic)
-                except TapeError as e:
-                    print(str(e))
-            
             elif args.cmd == 'skip':
-                dev.skip_block(args.count)
+                dev.skip(args.count)
                 print(f"Skipped {args.count} block(s)")
             
             elif args.cmd == 'space':
-                dev.skip_file(args.count)
+                dev.space(args.count)
                 print(f"Spaced {args.count} file(s)")
             
             elif args.cmd == 'density':
                 dev.set_density(1 if args.mode == '1600' else 2)
                 print(f"Set density to {args.mode}")
             
-            elif args.cmd == 'config':
-                cfg = dev.get_config()
-                if args.retries is not None:
-                    cfg.retries = args.retries
-                if args.stop is not None:
-                    cfg.stop_tapemarks = args.stop
-                if args.stop_error:
-                    cfg.stop_on_error = True
-                if any([args.retries, args.stop, args.stop_error]):
-                    dev.set_config(cfg)
-                    print("Configuration updated")
-                print(f"Retries: {cfg.retries}")
-                print(f"Stop after: {cfg.stop_tapemarks} tapemarks")
-                print(f"Stop on error: {cfg.stop_on_error}")
+            elif args.cmd == 'read':
+                status, data = dev.read_block()
+                print(f"Status: 0x{status:04X}, Length: {len(data)}")
+                if data:
+                    # Hex dump first 256 bytes
+                    for i in range(0, min(len(data), 256), 16):
+                        hex_part = ' '.join(f'{b:02X}' for b in data[i:i+16])
+                        asc_part = ''.join(chr(b) if 32 <= b < 127 else '.' for b in data[i:i+16])
+                        print(f'{i:04X}: {hex_part:<48} {asc_part}')
             
             elif args.cmd == 'create':
+                stop = ord('V') if args.stop_eov else args.stop
                 print(f"Reading tape to {args.filename}...")
-                stats = dev.create_image(args.filename, args.no_rewind,
-                                         args.stop, args.stop_error, args.stop_eov,
-                                         progress if args.verbose else None)
-                print(f"\n\nFile {args.filename} written.")
-                print(f"{stats['blocks']} blocks, {stats['files']} files, "
-                      f"{stats['bytes']} bytes, {stats['errors']} errors")
-                
-                # Prompt for optional comment (like GetComment in original)
-                try:
-                    comment = input("\nEnter a comment for this tape, or press Enter for none:\n")
-                    if comment.strip():
-                        comment_file = args.filename + '.txt'
-                        with open(comment_file, 'w') as cf:
-                            cf.write(comment.strip() + '\n')
-                        print(f"Comment saved to {comment_file}")
-                except (EOFError, KeyboardInterrupt):
-                    pass
+                stats = dev.create_image(
+                    args.filename,
+                    stop_tapemarks=stop,
+                    stop_on_error=args.stop_error,
+                    no_rewind=args.no_rewind,
+                    progress=progress_read if args.verbose else None
+                )
+                print(f"\nDone: {stats['blocks']} packets, {stats['bytes']} bytes")
             
             elif args.cmd == 'write':
                 print(f"Writing {args.filename} to tape...")
-                stats = dev.write_image(args.filename, args.no_rewind,
-                                        progress if args.verbose else None)
-                print(f"\n\nFile {args.filename} written to tape.")
-                print(f"{stats['blocks']} blocks, {stats['files']} files, "
-                      f"{stats['bytes']} bytes")
+                stats = dev.write_image(
+                    args.filename,
+                    no_rewind=args.no_rewind,
+                    progress=progress_write if args.verbose else None
+                )
+                print(f"\nDone: {stats['blocks']} packets, {stats['bytes']} bytes")
     
     except TapeError as e:
         print(f"Error: {e}")

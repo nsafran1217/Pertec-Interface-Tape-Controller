@@ -1,5 +1,8 @@
 /*
- * usb.h - USB CDC Interface for Tape Utility
+ * usb.h - USB CDC Interface with file-like streaming
+ * 
+ * Provides replacement functions for FatFS f_read/f_write/f_close
+ * that stream data over USB to the host application.
  */
 
 #ifndef USB_H
@@ -8,143 +11,81 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-/* Protocol sync bytes */
-#define CMD_SYNC_BYTE   0xAA
-#define RESP_SYNC_BYTE  0x55
+/* Result codes (compatible with FatFS FRESULT) */
+typedef enum {
+    USB_OK = 0,
+    USB_ERR_IO,
+    USB_ERR_TIMEOUT,
+    USB_ERR_ABORT,
+} USB_Result;
 
-/* Maximum payload size */
-#define USB_MAX_PAYLOAD 4096
+/* Transfer direction */
+typedef enum {
+    USB_DIR_NONE = 0,
+    USB_DIR_READ,       /* Host -> MCU (for WriteImage) */
+    USB_DIR_WRITE,      /* MCU -> Host (for CreateImage) */
+} USB_Direction;
 
-/* Command codes */
-enum usb_cmd {
-    CMD_NOP             = 0x00,
-    CMD_GET_INFO        = 0x01,
-    CMD_GET_STATUS      = 0x02,
-    CMD_RESET           = 0x03,
-    
-    /* Configuration */
-    CMD_SET_CONFIG      = 0x10,
-    CMD_GET_CONFIG      = 0x11,
-    CMD_SET_DENSITY     = 0x12,
-    CMD_SET_ADDRESS     = 0x13,
-    
-    /* Tape motion */
-    CMD_REWIND          = 0x20,
-    CMD_UNLOAD          = 0x21,
-    CMD_SKIP_BLOCK      = 0x22,
-    CMD_SKIP_FILE       = 0x23,
-    
-    /* Data transfer */
-    CMD_READ_BLOCK      = 0x30,
-    CMD_WRITE_BLOCK     = 0x31,
-    CMD_WRITE_FILEMARK  = 0x32,
-    
-    /* Streaming mode for image transfer */
-    CMD_READ_START      = 0x40,
-    CMD_READ_NEXT       = 0x41,
-    CMD_READ_STOP       = 0x42,
-    CMD_WRITE_START     = 0x43,
-    CMD_WRITE_NEXT      = 0x44,
-    CMD_WRITE_STOP      = 0x45,
+/* Command codes from host */
+#define HOST_CMD_NOP          0x00
+#define HOST_CMD_STATUS       0x01
+#define HOST_CMD_REWIND       0x02
+#define HOST_CMD_UNLOAD       0x03
+#define HOST_CMD_SKIP         0x04
+#define HOST_CMD_SPACE        0x05
+#define HOST_CMD_READ_BLOCK   0x06
+#define HOST_CMD_SET_DENSITY  0x07
+#define HOST_CMD_CREATE_IMAGE 0x10   /* Tape -> Host (read tape, send TAP) */
+#define HOST_CMD_WRITE_IMAGE  0x11   /* Host -> Tape (receive TAP, write tape) */
+#define HOST_CMD_ABORT        0xFF
 
-    CMD_DEBUG_INFO      = 0xF0
-};
+/* Response codes to host */
+#define RESP_OK               0x00
+#define RESP_ERR              0x01
+#define RESP_BUSY             0x02
+#define RESP_DATA             0x10   /* Data follows */
+#define RESP_DONE             0x20   /* Transfer complete */
+#define RESP_NEED_DATA        0x30   /* Ready for more data */
 
-/* Response codes */
-enum usb_resp {
-    RESP_OK             = 0x00,
-    RESP_ERR_UNKNOWN    = 0x01,
-    RESP_ERR_CMD        = 0x02,
-    RESP_ERR_PARAM      = 0x03,
-    RESP_ERR_OFFLINE    = 0x04,
-    RESP_ERR_TIMEOUT    = 0x05,
-    RESP_ERR_PROTECTED  = 0x06,
-    RESP_ERR_CHECKSUM   = 0x07,
-    
-    /* Tape-specific responses */
-    RESP_TAPEMARK       = 0x10,
-    RESP_EOT            = 0x11,
-    RESP_LOADPOINT      = 0x12,
-    RESP_HARDERR        = 0x13,
-    RESP_CORRERR        = 0x14,
-    RESP_BLANK          = 0x15,
-    RESP_LENGTH         = 0x16,
-    
-    RESP_DATA           = 0x80,
-};
-
-/* Command packet header */
-typedef struct __attribute__((packed)) {
-    uint8_t  sync;
-    uint8_t  cmd;
-    uint16_t seq;
-    uint16_t len;
-    uint16_t crc;
-} usb_cmd_hdr_t;
-
-/* Response packet header */
-typedef struct __attribute__((packed)) {
-    uint8_t  sync;
-    uint8_t  status;
-    uint16_t seq;
-    uint16_t len;
-    uint16_t crc;
-} usb_resp_hdr_t;
-
-/* Device info response */
-typedef struct __attribute__((packed)) {
-    uint8_t  protocol_ver;
-    uint8_t  fw_major;
-    uint8_t  fw_minor;
-    uint8_t  fw_patch;
-    uint32_t capabilities;
-    uint16_t max_payload;
-    uint16_t buffer_size;
-} usb_device_info_t;
-
-/* Tape status response - mirrors your PERTEC status bits */
-typedef struct __attribute__((packed)) {
-    uint16_t raw_status;      /* Raw PERTEC status word */
-    uint8_t  online;
-    uint8_t  ready;
-    uint8_t  loadpoint;
-    uint8_t  eot;
-    uint8_t  protected;
-    uint8_t  rewinding;
-    uint8_t  filemark;
-    uint8_t  error;
-    uint32_t position;
-} usb_tape_status_t;
-
-/* Configuration structure */
-typedef struct __attribute__((packed)) {
-    uint8_t  retries;
-    uint8_t  stop_tapemarks;
-    uint8_t  stop_on_error;
-    uint8_t  density;         /* 0=auto, 1=1600, 2=6250 */
-    uint16_t tape_address;
-    uint16_t timeout_ms;
-} usb_config_t;
-
-/* Read block response header */
-typedef struct __attribute__((packed)) {
-    uint32_t length;          /* Actual bytes read */
-    uint8_t  flags;           /* Error flags: bit0=corrected, bit1=hard error */
-} usb_read_hdr_t;
-
-/* Initialize USB CDC */
+/* Initialize USB subsystem */
 void USB_Init(void);
 
 /* Poll USB - call from main loop */
 void USB_Poll(void);
 
-/* Check if USB is connected */
+/* Check if USB is connected/configured */
 bool USB_IsConnected(void);
 
-/* Process incoming commands - returns true if command was processed */
-bool USB_ProcessCommands(void);
+/* Check for and process host commands - returns command code or 0 */
+uint8_t USB_CheckCommand(uint8_t *params, uint16_t *param_len);
 
-/* CRC-16-CCITT */
-uint16_t USB_CRC16(const uint8_t *data, uint16_t len);
+/* Send a simple response to host */
+void USB_SendResponse(uint8_t code);
+
+/* Send response with data */
+void USB_SendResponseData(uint8_t code, const void *data, uint16_t len);
+
+/* Send status/error message to host (replaces Uprintf for status) */
+void USB_SendMessage(const char *msg);
+
+/*
+ * File-like streaming interface
+ * These replace FatFS f_read/f_write/f_close
+ */
+
+/* Start a transfer session */
+USB_Result USB_OpenTransfer(USB_Direction dir);
+
+/* Write data to host (replaces f_write for CreateImage) */
+USB_Result USB_Write(const void *data, uint32_t len, uint32_t *written);
+
+/* Read data from host (replaces f_read for WriteImage) */
+USB_Result USB_Read(void *data, uint32_t len, uint32_t *read);
+
+/* End transfer session */
+USB_Result USB_CloseTransfer(void);
+
+/* Check if host requested abort (replaces CheckForEscape) */
+bool USB_CheckAbort(void);
 
 #endif /* USB_H */

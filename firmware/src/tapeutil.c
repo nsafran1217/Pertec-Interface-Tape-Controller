@@ -1,8 +1,16 @@
 /*
- * tapeutil.c - Tape Utilities for USB Host Mode
+ * tapeutil.c - Tape Utilities (USB Host Mode)
  * 
- * All file I/O is handled by the host application.
- * This module provides tape operations called via USB commands.
+ * Modified from original to use USB streaming instead of FatFS.
+ * Program flow remains the same - this module assembles/parses TAP files.
+ * 
+ * Key changes:
+ *   f_write() -> USB_Write()
+ *   f_read()  -> USB_Read()
+ *   f_open()  -> USB_OpenTransfer()
+ *   f_close() -> USB_CloseTransfer()
+ *   CheckForEscape() -> USB_CheckAbort()
+ *   Uprintf() -> removed (host handles display)
  */
 
 #include <stdint.h>
@@ -18,363 +26,458 @@
 #include "tapeutil.h"
 #include "tapedriver.h"
 #include "pertbits.h"
+#include "tap.h"
+#include "usb.h"
 
-/* Module state */
-static uint32_t TapePosition = 0;
-static uint32_t BytesTransferred = 0;
-static uint32_t ErrorCount = 0;
+/* Local variables */
+static uint32_t TapePosition;
+static uint32_t BytesCopied;
+
+/* Status structure sent to host */
+typedef struct __attribute__((packed)) {
+    uint16_t raw_status;
+    uint32_t position;
+    uint32_t bytes_copied;
+    uint8_t  online;
+    uint8_t  ready;
+    uint8_t  loadpoint;
+    uint8_t  eot;
+    uint8_t  protected;
+    uint8_t  rewinding;
+} TapeStatusReport;
 
 /*
- * TapeUtil_Init - Initialize tape utility module
+ * GetTapeStatus - Send tape status to host
  */
-void TapeUtil_Init(void)
+void GetTapeStatus(void)
 {
-    TapePosition = 0;
-    BytesTransferred = 0;
-    ErrorCount = 0;
-    TapeInit();
-}
-
-/*
- * TapeUtil_GetPosition - Get current tape position (block count)
- */
-uint32_t TapeUtil_GetPosition(void)
-{
-    if (TapeStatus() & PS1_ILDP)
+    uint16_t stat = TapeStatus();
+    TapeStatusReport rpt;
+    
+    rpt.raw_status = stat;
+    rpt.position = TapePosition;
+    rpt.bytes_copied = BytesCopied;
+    rpt.online = (stat & PS1_IONL) ? 1 : 0;
+    rpt.ready = (stat & PS1_IRDY) ? 1 : 0;
+    rpt.loadpoint = (stat & PS1_ILDP) ? 1 : 0;
+    rpt.eot = (stat & PS1_EOT) ? 1 : 0;
+    rpt.protected = (stat & PS1_IFPT) ? 1 : 0;
+    rpt.rewinding = (stat & PS1_IRWD) ? 1 : 0;
+    
+    if (rpt.loadpoint)
         TapePosition = 0;
-    return TapePosition;
-}
-
-/*
- * TapeUtil_GetBytesTransferred - Get total bytes transferred
- */
-uint32_t TapeUtil_GetBytesTransferred(void)
-{
-    return BytesTransferred;
-}
-
-/*
- * TapeUtil_GetErrorCount - Get error count
- */
-uint32_t TapeUtil_GetErrorCount(void)
-{
-    return ErrorCount;
-}
-
-/*
- * TapeUtil_ResetCounters - Reset transfer statistics
- */
-void TapeUtil_ResetCounters(void)
-{
-    TapePosition = 0;
-    BytesTransferred = 0;
-    ErrorCount = 0;
-}
-
-/*
- * TapeUtil_GetStatus - Get detailed tape status
- * 
- * Returns raw PERTEC status word and fills in decoded status structure
- */
-uint16_t TapeUtil_GetStatus(tape_status_t *st)
-{
-    uint16_t raw = TapeStatus();
     
-    if (st)
-    {
-        st->raw_status = raw;
-        st->online     = (raw & PS1_IONL) ? 1 : 0;
-        st->ready      = (raw & PS1_IRDY) ? 1 : 0;
-        st->loadpoint  = (raw & PS1_ILDP) ? 1 : 0;
-        st->eot        = (raw & PS1_EOT)  ? 1 : 0;
-        st->protected  = (raw & PS1_IFPT) ? 1 : 0;
-        st->rewinding  = (raw & PS1_IRWD) ? 1 : 0;
-        st->filemark   = (raw & PS0_IFMK) ? 1 : 0;
-        st->hard_error = (raw & PS0_IHER) ? 1 : 0;
-        st->soft_error = (raw & PS0_ICER) ? 1 : 0;
-        st->data_busy  = (raw & PS0_IDBY) ? 1 : 0;
-        st->high_speed = (raw & PS0_ISPEED) ? 1 : 0;
-        st->nrzi_mode  = (raw & PS1_INRZ) ? 1 : 0;
-        st->position   = TapePosition;
-        
-        if (st->loadpoint)
-            TapePosition = 0;
+    USB_SendResponseData(RESP_OK, &rpt, sizeof(rpt));
+}
+
+/*
+ * DoRewind - Rewind tape
+ */
+void DoRewind(void)
+{
+    if (!IsTapeOnline()) {
+        USB_SendResponse(RESP_ERR);
+        return;
     }
     
-    return raw;
-}
-
-/*
- * TapeUtil_Rewind - Rewind tape to BOT
- * 
- * Returns: TSTAT_* status code
- */
-uint16_t TapeUtil_Rewind(void)
-{
-    uint16_t stat;
-    
-    if (!IsTapeOnline())
-        return TSTAT_OFFLINE;
-    
     TapePosition = 0;
-    stat = TapeRewind();
-    return stat;
+    TapeRewind();
+    USB_SendResponse(RESP_OK);
 }
 
 /*
- * TapeUtil_Unload - Unload tape (rewind and go offline)
- * 
- * Returns: TSTAT_* status code
+ * DoUnload - Unload tape
  */
-uint16_t TapeUtil_Unload(void)
+void DoUnload(void)
 {
+    TapeUnload();
     TapePosition = 0;
-    return TapeUnload();
+    USB_SendResponse(RESP_OK);
 }
 
 /*
- * TapeUtil_ReadBlock - Read one block from tape
- * 
- * Parameters:
- *   buffer    - destination buffer
- *   max_len   - maximum bytes to read
- *   bytes_read - actual bytes read (output)
- *   flags     - error flags (output): bit0=corrected, bit1=hard, bit2=length
- * 
- * Returns: TSTAT_* status code
+ * DoSkip - Skip blocks forward or backward
+ * params[0-1] = signed 16-bit count
  */
-uint16_t TapeUtil_ReadBlock(uint8_t *buffer, uint16_t max_len, 
-                            int *bytes_read, uint8_t *flags)
+void DoSkip(const uint8_t *params)
 {
-    uint16_t stat;
-    int count = 0;
-    
-    if (flags) *flags = 0;
-    if (bytes_read) *bytes_read = 0;
-    
-    if (!IsTapeOnline())
-        return TSTAT_OFFLINE;
-    
-    stat = TapeRead(buffer, max_len, &count);
-    DBprintf("stat=%d bytes=%d buffer[0]=%d\n", stat, bytes_read, buffer[0]);
-    if (bytes_read)
-        *bytes_read = count;
-    
-    /* Set error flags */
-    if (flags)
-    {
-        if (stat & TSTAT_CORRERR) *flags |= 0x01;
-        if (stat & TSTAT_HARDERR) *flags |= 0x02;
-        if (stat & TSTAT_LENGTH)  *flags |= 0x04;
-    }
-    
-    /* Update statistics */
-    if (!(stat & TSTAT_TAPEMARK))
-        TapePosition++;
-    
-    if (count > 0)
-        BytesTransferred += count;
-    
-    if (stat & (TSTAT_HARDERR | TSTAT_CORRERR))
-        ErrorCount++;
-    
-    return stat;
-}
-
-/*
- * TapeUtil_WriteBlock - Write one block to tape
- * 
- * Parameters:
- *   buffer - data to write
- *   len    - bytes to write (0 = write tapemark)
- * 
- * Returns: TSTAT_* status code
- */
-uint16_t TapeUtil_WriteBlock(const uint8_t *buffer, uint16_t len)
-{
-    uint16_t stat;
-    
-    if (!IsTapeOnline())
-        return TSTAT_OFFLINE;
-    
-    if (IsTapeProtected())
-        return TSTAT_PROTECT;
-    
-    stat = TapeWrite((uint8_t *)buffer, len);
-    
-    TapePosition++;
-    if (len > 0)
-        BytesTransferred += len;
-    
-    if (stat & TSTAT_HARDERR)
-        ErrorCount++;
-    
-    return stat;
-}
-
-/*
- * TapeUtil_WriteFilemark - Write a tape mark
- * 
- * Returns: TSTAT_* status code
- */
-uint16_t TapeUtil_WriteFilemark(void)
-{
-    return TapeUtil_WriteBlock(NULL, 0);
-}
-
-/*
- * TapeUtil_SkipBlock - Skip one or more blocks
- * 
- * Parameters:
- *   count - blocks to skip (negative = reverse)
- * 
- * Returns: TSTAT_* status code of last operation
- */
-uint16_t TapeUtil_SkipBlock(int16_t count)
-{
-    uint16_t stat = TSTAT_NOERR;
+    int16_t count = (int16_t)(params[0] | (params[1] << 8));
     int dir = 1;
+    unsigned int status;
     
-    if (!IsTapeOnline())
-        return TSTAT_OFFLINE;
+    if (!IsTapeOnline()) {
+        USB_SendResponse(RESP_ERR);
+        return;
+    }
     
-    if (count == 0)
-        return TSTAT_NOERR;
+    if (count == 0) {
+        USB_SendResponse(RESP_OK);
+        return;
+    }
     
-    if (count < 0)
-    {
+    if (count < 0) {
         count = -count;
         dir = -1;
     }
     
-    while (count--)
-    {
-        stat = SkipBlock(dir);
-        
-        /* Check for load point */
-        if (TapeStatus() & PS1_ILDP)
-        {
+    while (count--) {
+        status = SkipBlock(dir);
+        if (TapeStatus() & PS1_ILDP) {
             TapePosition = 0;
             break;
         }
+        if (status != TSTAT_NOERR) break;
         
-        if (stat != TSTAT_NOERR)
-            break;
-        
-        if (dir < 0)
-        {
-            if (TapePosition > 0)
-                TapePosition--;
-        }
-        else
-        {
+        if (dir < 0) {
+            if (TapePosition) TapePosition--;
+        } else {
             TapePosition++;
         }
     }
     
-    return stat;
+    USB_SendResponse(RESP_OK);
 }
 
 /*
- * TapeUtil_SkipFile - Skip one or more files (to next tapemark)
- * 
- * Parameters:
- *   count - files to skip (negative = reverse)
- * 
- * Returns: TSTAT_* status code of last operation
+ * DoSpace - Space files forward or backward
+ * params[0-1] = signed 16-bit count
  */
-uint16_t TapeUtil_SkipFile(int16_t count)
+void DoSpace(const uint8_t *params)
 {
-    uint16_t stat = TSTAT_NOERR;
+    int16_t count = (int16_t)(params[0] | (params[1] << 8));
     int dir = 1;
+    unsigned int status;
     
-    if (!IsTapeOnline())
-        return TSTAT_OFFLINE;
+    if (!IsTapeOnline()) {
+        USB_SendResponse(RESP_ERR);
+        return;
+    }
     
-    if (count == 0)
-        return TSTAT_NOERR;
+    if (count == 0) {
+        USB_SendResponse(RESP_OK);
+        return;
+    }
     
-    if (count < 0)
-    {
+    if (count < 0) {
         count = -count;
         dir = -1;
     }
     
-    while (count--)
-    {
-        stat = SpaceFile(dir);
-        
-        if (stat != TSTAT_NOERR)
-            break;
+    while (count--) {
+        status = SpaceFile(dir);
+        if (status != TSTAT_NOERR) break;
     }
     
-    /* Position is now relative to filemark */
     TapePosition = 0;
-    
-    return stat;
+    USB_SendResponse(RESP_OK);
 }
 
 /*
- * TapeUtil_SetDensity - Set tape density
- * 
- * Parameters:
- *   density - 1 = 1600 PE, 2 = 6250 GCR
- * 
- * Returns: true if successful, false if not at BOT
+ * DoReadBlock - Read and send a single block
  */
-bool TapeUtil_SetDensity(uint8_t density)
+void DoReadBlock(void)
 {
-    if (!(TapeStatus() & PS1_ILDP))
-        return false;  /* Must be at BOT */
+    unsigned int status;
+    int bytesRead;
     
-    if (density == 1)
+    if (!IsTapeOnline()) {
+        USB_SendResponse(RESP_ERR);
+        return;
+    }
+    
+    status = TapeRead(TapeBuffer, TAPE_BUFFER_SIZE, &bytesRead);
+    
+    /* Build response: [status:2][length:4][data...] */
+    uint8_t hdr[6];
+    hdr[0] = status & 0xFF;
+    hdr[1] = (status >> 8) & 0xFF;
+    hdr[2] = bytesRead & 0xFF;
+    hdr[3] = (bytesRead >> 8) & 0xFF;
+    hdr[4] = (bytesRead >> 16) & 0xFF;
+    hdr[5] = (bytesRead >> 24) & 0xFF;
+    
+    /* Send header first */
+    USB_SendResponseData(RESP_DATA, hdr, sizeof(hdr));
+    
+    /* Send data if any */
+    if (bytesRead > 0) {
+        uint32_t written;
+        USB_Write(TapeBuffer, bytesRead, &written);
+    }
+    
+    TapePosition++;
+}
+
+/*
+ * DoSetDensity - Set tape density
+ * params[0] = 1 for 1600, 2 for 6250
+ */
+void DoSetDensity(const uint8_t *params)
+{
+    if (!(TapeStatus() & PS1_ILDP)) {
+        USB_SendResponse(RESP_ERR);  /* Must be at BOT */
+        return;
+    }
+    
+    if (params[0] == 1)
         Set1600();
-    else if (density == 2)
+    else if (params[0] == 2)
         Set6250();
-    else
-        return false;
     
-    return true;
+    USB_SendResponse(RESP_OK);
 }
 
 /*
- * TapeUtil_SetAddress - Set tape drive/formatter address
- */
-void TapeUtil_SetAddress(uint16_t addr)
-{
-    SetTapeAddress(addr);
-}
-
-/*
- * TapeUtil_IssueCommand - Send raw command (for debugging)
- */
-void TapeUtil_IssueCommand(uint16_t cmd)
-{
-    IssueTapeCommand(cmd);
-}
-
-/*
- * TapeUtil_CheckEOV - Check if buffer starts with EOV label
+ * DoCreateImage - Read tape and stream TAP image to host
  * 
- * Parameters:
- *   buffer - data buffer to check
- *   len    - buffer length
- * 
- * Returns: true if EOV detected (ASCII or EBCDIC)
+ * params[0] = stop_tapemarks (1-9, or 'V' for EOV)
+ * params[1] = stop_on_error flag
+ * params[2] = no_rewind flag
  */
-bool TapeUtil_CheckEOV(const uint8_t *buffer, uint16_t len)
+void DoCreateImage(const uint8_t *params)
 {
-    static const uint8_t eov_ascii[3]  = { 'E', 'O', 'V' };
-    static const uint8_t eov_ebcdic[3] = { 0xC5, 0xD6, 0xE5 };
+    bool noRewind;
+    bool abort;
+    int fileCount;
+    int tapeMarkSeen;
+    uint32_t tapeHeader;
+    uint32_t wc;
+    uint8_t stopTapemarks;
+    bool stopAfterError;
     
-    if (len < 3)
-        return false;
+    stopTapemarks = params[0];
+    stopAfterError = params[1] ? true : false;
+    noRewind = params[2] ? true : false;
     
-    if (memcmp(buffer, eov_ascii, 3) == 0)
-        return true;
+    /* Check if tape is online */
+    if (!IsTapeOnline()) {
+        USB_SendResponse(RESP_ERR);
+        return;
+    }
     
-    if (memcmp(buffer, eov_ebcdic, 3) == 0)
-        return true;
+    /* Rewind if requested */
+    if (!noRewind)
+        TapeRewind();
     
-    return false;
+    /* Open transfer - tell host we're sending TAP data */
+    if (USB_OpenTransfer(USB_DIR_WRITE) != USB_OK) {
+        USB_SendResponse(RESP_ERR);
+        return;
+    }
+    
+    /* Initialize counters */
+    TapePosition = 0;
+    tapeMarkSeen = 0;
+    BytesCopied = 0;
+    fileCount = 0;
+    abort = false;
+    
+    /* Main read loop */
+    while (true) {
+        unsigned int readStat;
+        int readCount;
+        
+        /* Check for abort from host */
+        if (USB_CheckAbort()) {
+            abort = true;
+            break;
+        }
+        
+        /* Read forward */
+        readStat = TapeRead(TapeBuffer, TAPE_BUFFER_SIZE, &readCount);
+        tapeHeader = readCount;
+        
+        /* Check for stop conditions */
+        if (stopAfterError && (readStat & TSTAT_HARDERR)) {
+            break;
+        }
+        
+        if ((readStat & TSTAT_BLANK) || (readStat & TSTAT_EOT)) {
+            break;
+        }
+        
+        /* Check for tapemark */
+        if (readStat & TSTAT_TAPEMARK) {
+            tapeMarkSeen++;
+            fileCount++;
+            readCount = 0;
+        } else {
+            tapeMarkSeen = 0;
+        }
+        
+        /* Set error flag if needed */
+        if (readStat & TSTAT_LENGTH) {
+            tapeHeader |= TAP_ERROR_FLAG;
+        }
+        
+        if (readStat & TSTAT_HARDERR) {
+            tapeHeader |= TAP_ERROR_FLAG;
+        }
+        
+        TapePosition++;
+        
+        /* Write TAP record header */
+        USB_Write(&tapeHeader, sizeof(tapeHeader), &wc);
+        
+        /* Write data and trailer if not a tapemark */
+        if (readCount) {
+            USB_Write(TapeBuffer, readCount, &wc);
+            USB_Write(&tapeHeader, sizeof(tapeHeader), &wc);
+        }
+        
+        BytesCopied += readCount;
+        
+        /* Check for EOV stop condition */
+        if (stopTapemarks == 'V') {
+            const uint8_t stopASCII[3] = { 'E', 'O', 'V' };
+            const uint8_t stopEBCDIC[3] = { 0xC5, 0xD6, 0xE5 };
+            
+            if (readCount >= 3) {
+                if (!memcmp(TapeBuffer, stopASCII, 3) ||
+                    !memcmp(TapeBuffer, stopEBCDIC, 3)) {
+                    break;
+                }
+            }
+        }
+        
+        /* Check for consecutive tapemarks */
+        if (tapeMarkSeen == stopTapemarks) {
+            fileCount -= (stopTapemarks - 1);
+            break;
+        }
+    }
+    
+    /* Write EOM marker */
+    tapeHeader = TAP_EOM;
+    USB_Write(&tapeHeader, sizeof(tapeHeader), &wc);
+    
+    /* Close transfer */
+    USB_CloseTransfer();
+    
+    /* Rewind if requested */
+    if (!noRewind && !abort) {
+        TapeRewind();
+        TapePosition = 0;
+    }
+}
+
+/*
+ * DoWriteImage - Receive TAP image from host and write to tape
+ * 
+ * params[0] = no_rewind flag
+ */
+void DoWriteImage(const uint8_t *params)
+{
+    bool noRewind;
+    bool abort;
+    int fileCount;
+    unsigned int status;
+    
+    noRewind = params[0] ? true : false;
+    
+    /* Check if tape is online */
+    if (!IsTapeOnline()) {
+        USB_SendResponse(RESP_ERR);
+        return;
+    }
+    
+    /* Check write protection */
+    if (IsTapeProtected()) {
+        USB_SendResponse(RESP_ERR);
+        return;
+    }
+    
+    /* Rewind if requested */
+    if (!noRewind)
+        TapeRewind();
+    
+    /* Open transfer - tell host to send TAP data */
+    if (USB_OpenTransfer(USB_DIR_READ) != USB_OK) {
+        USB_SendResponse(RESP_ERR);
+        return;
+    }
+    
+    /* Initialize */
+    abort = false;
+    TapePosition = 0;
+    BytesCopied = 0;
+    fileCount = 0;
+    status = TSTAT_NOERR;
+    
+    /* Main write loop */
+    while (true) {
+        uint32_t header1;
+        uint32_t header2;
+        uint32_t bytesRead;
+        uint32_t bcount;
+        
+        /* Read TAP header from host */
+        if (USB_Read(&header1, sizeof(header1), &bytesRead) != USB_OK) {
+            abort = true;
+            break;
+        }
+        
+        if (bytesRead == 0) break;  /* End of data from host */
+        
+        if (bytesRead != sizeof(header1)) {
+            abort = true;
+            break;
+        }
+        
+        /* Check for abort */
+        if (USB_CheckAbort()) {
+            abort = true;
+            break;
+        }
+        
+        /* Check for EOM */
+        if (header1 == TAP_EOM) break;
+        
+        TapePosition++;
+        
+        if (header1 != 0) {
+            /* Data block */
+            bool corrupt = true;
+            
+            bcount = header1 & TAP_LENGTH_MASK;
+            
+            if (bcount <= TAPE_BUFFER_SIZE) {
+                /* Read data */
+                if (USB_Read(TapeBuffer, bcount, &bytesRead) == USB_OK &&
+                    bytesRead == bcount) {
+                    /* Read trailer */
+                    if (USB_Read(&header2, sizeof(header2), &bytesRead) == USB_OK &&
+                        bytesRead == sizeof(header2)) {
+                        if (header1 == header2) {
+                            corrupt = false;
+                            status = TapeWrite(TapeBuffer, bcount);
+                        }
+                    }
+                }
+            }
+            
+            if (corrupt) {
+                abort = true;
+                break;
+            }
+        } else {
+            /* Tapemark */
+            bcount = 0;
+            status = TapeWrite(TapeBuffer, 0);
+            fileCount++;
+        }
+        
+        BytesCopied += bcount;
+        
+        if (status != TSTAT_NOERR) break;
+    }
+    
+    /* Close transfer */
+    USB_CloseTransfer();
+    
+    /* Rewind if requested */
+    if (!noRewind && !abort) {
+        TapeRewind();
+        TapePosition = 0;
+    }
 }
