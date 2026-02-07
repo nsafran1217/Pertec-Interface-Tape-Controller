@@ -11,17 +11,16 @@
 
 #include "license.h"
 
-#include "ff.h"
+
 #include "comm.h"
-#include "rtcsubs.h"
+
 #include "gpiodef.h"
 #include "globals.h"
-#include "sdiosubs.h"
+
 #include "miscsubs.h"
-#include "filesub.h"
-#include "cli.h"
+
 #include "tapedriver.h"
-#include "filedef.h"
+
 #include "dbserial.h"
 
 // Private function prototypes
@@ -78,42 +77,13 @@ static void Init( void)
 
   Milliseconds = 0;                     // start off ticker
   InitGPIO();				// set up primary GPIOs
-  SD_GPIO_Init();			// initialize the SD interface
+  
   SetupSysTick();			// get the milliscond timer going
   DelaySetup();				// set up delay timer
 
   InitACM(115200);			// initialize USB comm
 
-//  Wait for console check-in.  
 
-  Ugets( (char *) Buffer, 256);         // just clear out any input garbage
-
-  while(1)
-  {
-    char c;
-
-    Uprintf( "\nPress \'G\' start\n");
- 
-    c =  Ugetchar();
-    if ( c == 'g' || c == 'G')
-      break;
-  } // wait for a go
-    
-  Uprintf("\nTape Utility version " VERSION " ready...\n"
-          "Enter \"HELP\" for a command description\n");
-
-//  Get the real-time clock going.
-
-  InitializeRTC();
-
-  Uprintf( "\nRTC initialized.\n");
-
-//  Get SDIO going.
-
-  SD_Init();				// initialize SDcard.
-  MountSD( 0);				// do it twice
-  Uprintf( "SDIO initialized.\n");
-  
 //  Initialize the tape interface.
 
   TapeInit();  

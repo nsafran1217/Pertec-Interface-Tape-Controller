@@ -26,9 +26,9 @@
 #include "comm.h"
 #include "gpiodef.h"
 #include "miscsubs.h"
-#include "rtcsubs.h"
+
 #include "globals.h"
-#include "filedef.h"
+
 #include "tapeutil.h"
 #include "tapedriver.h"
 #include "pertbits.h"

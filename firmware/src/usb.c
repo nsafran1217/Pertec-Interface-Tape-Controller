@@ -16,7 +16,7 @@
 
 #include "dbserial.h"
 
-#include "sdiosubs.h"
+
 #include "comm.h"
 #include "usbserial.h"
 
@@ -385,9 +385,8 @@ static void usb_suspend_callback()
 
 static uint32_t get_block_count(void) 
 {
-  DBprintf( "Get block count returns %d\n", SD_GetCardSize());
 
-    return SD_GetCardSize();
+    return 0;
 } // get_block_count
 
 //*	Read an SD block.
@@ -399,11 +398,8 @@ static uint32_t get_block_count(void)
 static int read_block(uint32_t lba, uint8_t *copy_to) 
 {
 
-  int stat;
 
-  stat = SD_ReadBlocks( copy_to, lba, 1);
-  SD_WaitComplete();
-  return stat;
+  return 0;
 } // read_block
 
 //*	Write an SD block
@@ -415,11 +411,7 @@ static int read_block(uint32_t lba, uint8_t *copy_to)
 static int write_block(uint32_t lba, const uint8_t *copy_from) 
 {
 
-  int stat;
-
-  stat = SD_WriteBlocks( (void *) copy_from, lba, 1);
-  SD_WaitComplete();
-  return stat;
+  return 0;
 } // write_block
 
 
@@ -457,12 +449,7 @@ int USInit(void)
   usbd_register_set_config_callback(usb_device, usb_cdc_set_config_callback);
   usbd_register_suspend_callback(usb_device, usb_suspend_callback);
 
-  if (!SD_GetCardSize())
-  {
-    DBprintf( "Initializing SD I/O\n");
-    SD_Init();				// if SD not initialized
-    DBprintf( "SD init returns\n");
-  }
+
 
   usb_msc_init(usb_device,
                USB_MSC_ENDPOINT_IN,
