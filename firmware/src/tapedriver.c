@@ -540,7 +540,7 @@ unsigned int TapeWrite( uint8_t *Buf, int Buflen)
 
 //	If we're at the second-to-last word, set "last word" flag.  
 
-        if (bcount == 2)
+        if (bcount == 1)
         {
           gpio_set( PCMD_GPIO, PCMD_BIT);	// set all bits to one
           gpio_clear( PCMD_GPIO, PC_ILWD);       // assert last word
