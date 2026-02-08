@@ -430,7 +430,6 @@ void HandleWriteImage(uint8_t flags)
             break;
         }
 
-        if (CheckAbort()) { abort = true; break; }
     }
 
     FlushRecordCount();

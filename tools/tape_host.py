@@ -319,30 +319,26 @@ class TapeController:
         if t != RSP_OK:
             raise RuntimeError(f"Unexpected response 0x{t:02X}")
 
+        # Send entire file as back-to-back CMD_FILE_DATA packets.
+        # USB hardware NAK provides flow control — pyserial's write
+        # blocks when the MCU can't accept more data.
         CHUNK = 4096
         try:
             with open(filename, "rb") as f:
                 while True:
-                    t, p = self.link.recv_pkt(timeout=120)
-                    if t == RSP_READY:
-                        chunk = f.read(CHUNK)
-                        if chunk:
-                            self.link.send_pkt(CMD_FILE_DATA, chunk)
-                        else:
-                            self.link.send_pkt(CMD_FILE_EOF)
-                            break
-                    elif t == RSP_IMG_DONE:
-                        return self._parse_img_done(p, 0)
-                    elif t == RSP_ERROR:
-                        msg = p[2:].decode("ascii", errors="replace") \
-                              if len(p) > 2 else ""
-                        raise RuntimeError(f"Error during write: {msg}")
+                    chunk = f.read(CHUNK)
+                    if not chunk:
+                        break
+                    self.link.send_pkt(CMD_FILE_DATA, chunk)
+            self.link.send_pkt(CMD_FILE_EOF)
         except KeyboardInterrupt:
             print("\nSending abort...")
             self.link.send_pkt(CMD_ABORT)
 
+        # Wait for MCU to finish processing and send completion summary.
+        # This may take a while as the MCU writes remaining data to tape.
         while True:
-            t, p = self.link.recv_pkt(timeout=60)
+            t, p = self.link.recv_pkt(timeout=300)
             if t == RSP_IMG_DONE:
                 return self._parse_img_done(p, 0)
             if t == RSP_ERROR:
