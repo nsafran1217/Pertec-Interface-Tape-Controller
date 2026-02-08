@@ -1,7 +1,6 @@
-
-/***********************************************************************
- * FILE: usb.c  (MSC and SD card code removed, CDC-only)
- ***********************************************************************/
+/*  USB CDC-only driver for tape controller.
+ *  ISR-driven receive so data arrives during TapeWrite.
+ */
 
 #include <stdint.h>
 #include <stdbool.h>
@@ -27,7 +26,7 @@
 #define USB_CDC_EP_IN    0x83
 
 #define USB_PKT  64
-#define INQ_SIZE 32768   /* large enough to pre-buffer tape records via ISR */
+#define INQ_SIZE 49152   /* 48KB: holds a full 32KB chunk + headroom for framing */
 
 static char  RxBuf[65];
 static char  InQ[INQ_SIZE];
@@ -256,6 +255,11 @@ int USInit(void)
 
     usbd_register_set_config_callback(udev, cdc_setcfg);
     usbd_register_suspend_callback(udev, cdc_suspend);
+
+    /* Enable interrupt-driven USB so data arrives into InQ even while
+       the main thread is busy bit-banging the Pertec interface. */
+    nvic_enable_irq(NVIC_OTG_FS_IRQ);
+
     return 0;
 }
 

@@ -504,7 +504,7 @@ void usb_disconnect(void);
 #define USB_CDC_EP_IN    0x83
 
 #define USB_PKT  64
-#define INQ_SIZE 32768   /* large enough to pre-buffer tape records via ISR */
+#define INQ_SIZE 49152   /* 48KB: holds a full 32KB chunk + headroom for framing */
 
 static char  RxBuf[65];
 static char  InQ[INQ_SIZE];
