@@ -5,96 +5,130 @@
 #include <string.h>
 #include <stdarg.h>
 #include <ctype.h>
+
 #include <libopencm3/stm32/rcc.h>
 #include <libopencm3/stm32/gpio.h>
 
-
 #include "license.h"
-
-
+#include "protocol.h"
+#include "hostcomm.h"
 #include "comm.h"
-
 #include "gpiodef.h"
 #include "globals.h"
-
 #include "miscsubs.h"
-
 #include "tapedriver.h"
-
+#include "tapeutil.h"
 #include "dbserial.h"
 
-// Private function prototypes
+/* ------------------------------------------------------------------ */
+/*  Command table                                                      */
+/* ------------------------------------------------------------------ */
 
-static void Init( void);
+typedef struct {
+    const char *name;
+    void (*handler)(char *args[]);
+} CMD_ENTRY;
 
+static CMD_ENTRY cmd_table[] = {
+    { "status",   CmdShowStatus   },
+    { "brief",    (void(*)(char**))ShowBriefStatus },
+    { "rewind",   CmdRewindTape   },
+    { "unload",   CmdUnloadTape   },
+    { "read",     CmdReadForward  },
+    { "skip",     CmdSkip         },
+    { "space",    CmdSpace        },
+    { "create",   CmdCreateImage  },
+    { "write",    CmdWriteImage   },
+    { "addr",     CmdSetAddr      },
+    { "retries",  CmdSetRetries   },
+    { "stop",     CmdSetStop      },
+    { "1600",     CmdSet1600      },
+    { "6250",     CmdSet6250      },
+    { "init",     CmdInitTape     },
+    { "debug",    CmdTapeDebug    },
+    { NULL, NULL }
+};
 
-//  Main program entry.
-//  -------------------
-//
-//  Perform initialiation (see "Init" routine)
-//  then exit to command processor.
-//
+/* ------------------------------------------------------------------ */
+/*  Command parser                                                     */
+/* ------------------------------------------------------------------ */
 
-int main(void) 
+#define MAX_ARGS 8
+
+static void DispatchCommand(char *line)
 {
+    char *args[MAX_ARGS + 1];
+    char *tok;
+    int   argc = 0;
 
-  Init();             // go do some initialization
+    /* Tokenize by spaces */
+    tok = strtok(line, " \t\r\n");
+    if (!tok) return;
 
-//   Uprintf( "Delay is %d\n",rcc_apb1_frequency / 4000000 - 1);
+    /* Find command */
+    char *cmd = tok;
+    tok = strtok(NULL, " \t\r\n");
+    while (tok && argc < MAX_ARGS) {
+        args[argc++] = tok;
+        tok = strtok(NULL, " \t\r\n");
+    }
+    args[argc] = NULL;
 
-  ProcessCommand();                     // never comes back
-  return 0; 
-} // main
+    /* Look up in table */
+    for (int i = 0; cmd_table[i].name; i++) {
+        if (strcasecmp(cmd, cmd_table[i].name) == 0) {
+            cmd_table[i].handler(args);
+            return;
+        }
+    }
+    Uprintf("Unknown command: %s\n", cmd);
+}
 
+/* ------------------------------------------------------------------ */
+/*  Protocol command loop – replaces old ProcessCommand()               */
+/* ------------------------------------------------------------------ */
 
-//* Initialization tasks.
-//  ---------------------
-//
-//	Sets things up:
-//
-//	  1)  GPIO configuration
-//	  2)  USB ACM (or UART) configuration
-//	  3)  Millisecond tick interrupt
-//	  4)  Microsecond delay timer
-//	  5)  Time of day clock
-//	  6)  SD card interface
-//	  7)  Tape interface
-//
-//	  8)  If SERIAL_DEBUG is defined, initialize UART1
-//
-//  
-
-static void Init( void) 
+static void ProcessCommand(void)
 {
+    char     cmd_buf[512];
+    uint8_t  pkt_type;
+    uint16_t pkt_len;
 
-//  Set system clock.
-  
- rcc_clock_setup_pll(&rcc_hse_8mhz_3v3[RCC_CLOCK_3V3_168MHZ]);
+    while (1) {
+        SendPacket(PKT_READY, NULL, 0);
 
- DBinit();				// initialize debugger
+        if (RecvPacket(&pkt_type, (uint8_t *)cmd_buf, &pkt_len) < 0)
+            continue;
 
-//  Set up the Systick timer for 1 msec tick.
+        if (pkt_type != PKT_CMD || pkt_len == 0)
+            continue;
 
-  Milliseconds = 0;                     // start off ticker
-  InitGPIO();				// set up primary GPIOs
-  
-  SetupSysTick();			// get the milliscond timer going
-  DelaySetup();				// set up delay timer
+        cmd_buf[pkt_len] = '\0';
+        DispatchCommand(cmd_buf);
+        SendPacket(PKT_DONE, NULL, 0);
+    }
+}
 
-  InitACM(115200);			// initialize USB comm
+/* ------------------------------------------------------------------ */
+/*  Initialization                                                     */
+/* ------------------------------------------------------------------ */
 
+static void Init(void)
+{
+    rcc_clock_setup_pll(&rcc_hse_8mhz_3v3[RCC_CLOCK_3V3_168MHZ]);
+    DBinit();
+    Milliseconds = 0;
+    InitGPIO();
+    SetupSysTick();
+    DelaySetup();
+    InitACM(115200);
+    TapeInit();
+    DBprintf("Firmware ready.\n");
+}
 
-//  Initialize the tape interface.
-
-  TapeInit();  
-  
-  Uprintf( "Tape I/O initialized.\n"); 
-
-//  Initialize the UART if serial debugging..
-
-  DBprintf( "Debug I/O ready.\n");
-
-  return;
-      
-} // Init
-
+int main(void)
+{
+    Init();
+    ProcessCommand();   /* never returns */
+    return 0;
+}

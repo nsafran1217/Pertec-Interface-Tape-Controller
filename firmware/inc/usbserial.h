@@ -1,19 +1,20 @@
-//  usbserial - procedures for usb and UART serial I/O.
-
 #ifndef _USBSERIAL
 #define _USBSERIAL
 
-int USInit( void);  		// initialize
-void USClear( void);		// clear buffer contents
-int USPutchar( char);   	// put a character
-int USWritechar( char);		// "raw" write character
-int USGetchar( void);   	// get a character
-int USCharReady( void); 	// test if character ready
-void USPuts( char *What);	// put string
-int USWriteBlock( uint8_t *What, int Count);	// write a block of data
+#include <stdint.h>
+#include <stdbool.h>
 
-//  Utility usb defs.
+int  USInit( void);
+void USClear( void);
 
+/* Block-level I/O for protocol layer */
+void USSendBlock(const uint8_t *Data, int Len);
+int  USRecvBlock(uint8_t *Data, int MaxLen);
+
+/* Non-blocking poll – drives USB stack, handles incoming data */
+void USPoll(void);
+
+/* Connection state */
 bool usb_get_connected(void);
 void usb_disconnect(void);
 

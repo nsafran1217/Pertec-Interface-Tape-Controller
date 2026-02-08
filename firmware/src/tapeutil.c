@@ -33,6 +33,7 @@
 #include "tapedriver.h"
 #include "pertbits.h"
 #include "tap.h"
+#include "hostio.h"
 
 //  Local variables.
 
