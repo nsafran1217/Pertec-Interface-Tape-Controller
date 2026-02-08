@@ -1,5 +1,9 @@
-/*  USB CDC-only driver for tape controller.
- *  ISR-driven receive so data arrives during TapeWrite.
+/*  USB CDC driver for tape controller.
+ *  ISR-driven RX and TX so tape I/O is never blocked by USB.
+ *
+ *  RX: ISR fills InQ ring buffer via cdc_rx callback.
+ *  TX: USWriteBlock memcpys into TxQ ring buffer and returns.
+ *      ISR drains TxQ 64 bytes at a time via tx_pump/tx_complete.
  */
 
 #include <stdint.h>
@@ -26,15 +30,30 @@
 #define USB_CDC_EP_IN    0x83
 
 #define USB_PKT  64
-#define INQ_SIZE 49152   /* 48KB: holds a full 32KB chunk + headroom for framing */
 
+/* --- Ring buffer sizes ---
+ * InQ:  48KB — holds incoming file data chunks from host
+ * TxQ:  48KB — holds outgoing image/status data for async drain
+ */
+#define INQ_SIZE 49152
+#define TXQ_SIZE 32768
+
+/* --- RX ring buffer --- */
 static char  RxBuf[65];
 static char  InQ[INQ_SIZE];
 static volatile int InQIn, InQOut;
 
+/* --- TX ring buffer --- */
+static uint8_t TxQ[TXQ_SIZE];
+static volatile int TxQIn, TxQOut;
+static volatile bool TxActive;    /* true if a USB TX is in progress */
+
 static char usb_serial_number[13];
 static usbd_device *udev;
 static bool usb_connected = false;
+
+/* Forward declarations */
+static void tx_pump(void);
 
 /* ---- descriptors ---- */
 
@@ -170,7 +189,7 @@ static const char *usb_strings[] = {
 
 uint8_t usbd_control_buffer[128];
 
-/* ---- callbacks ---- */
+/* ---- CDC control callback ---- */
 
 static enum usbd_request_return_codes cdc_ctrl(
     usbd_device *dev, struct usb_setup_data *req,
@@ -199,6 +218,8 @@ static enum usbd_request_return_codes cdc_ctrl(
     return USBD_REQ_NOTSUPP;
 }
 
+/* ---- RX callback (ISR context) ---- */
+
 static void cdc_rx(usbd_device *dev, uint8_t ep)
 {
     int len, i;
@@ -214,13 +235,62 @@ static void cdc_rx(usbd_device *dev, uint8_t ep)
     }
 }
 
+/* ---- TX pump and callback (ISR context) ---- */
+
+/*  tx_pump – send next chunk from TxQ to the USB IN endpoint.
+ *  Called from ISR context (tx_complete or kicked by USWriteBlock).
+ */
+static void tx_pump(void)
+{
+    int in  = TxQIn;    /* snapshot volatile */
+    int out = TxQOut;
+
+    if (in == out) {
+        TxActive = false;
+        return;
+    }
+
+    /* Calculate contiguous bytes available up to wrap point. */
+    int avail;
+    if (in > out)
+        avail = in - out;
+    else
+        avail = TXQ_SIZE - out;
+
+    if (avail > USB_PKT)
+        avail = USB_PKT;
+
+    if (usbd_ep_write_packet(udev, USB_DATA_EP_IN,
+                             (uint8_t *)&TxQ[out], avail) != 0) {
+        out += avail;
+        if (out >= TXQ_SIZE) out = 0;
+        TxQOut = out;
+        TxActive = true;
+    }
+    /* If write_packet returns 0, endpoint busy — retry on next interrupt. */
+}
+
+/*  tx_complete – IN endpoint TX-complete callback. Sends next chunk. */
+static void tx_complete(usbd_device *dev, uint8_t ep)
+{
+    (void)dev; (void)ep;
+    tx_pump();
+}
+
+/* ---- Config callback ---- */
+
 static void cdc_setcfg(usbd_device *dev, uint16_t wValue)
 {
     (void)wValue;
     if (!usb_connected) usb_connected = true;
-    usbd_ep_setup(dev, USB_DATA_EP_OUT, USB_ENDPOINT_ATTR_BULK, USB_PKT, cdc_rx);
-    usbd_ep_setup(dev, USB_DATA_EP_IN,  USB_ENDPOINT_ATTR_BULK, USB_PKT, NULL);
-    usbd_ep_setup(dev, USB_CDC_EP_IN,   USB_ENDPOINT_ATTR_INTERRUPT, 16, NULL);
+
+    usbd_ep_setup(dev, USB_DATA_EP_OUT, USB_ENDPOINT_ATTR_BULK,
+                  USB_PKT, cdc_rx);
+    usbd_ep_setup(dev, USB_DATA_EP_IN,  USB_ENDPOINT_ATTR_BULK,
+                  USB_PKT, tx_complete);   /* TX complete fires tx_pump */
+    usbd_ep_setup(dev, USB_CDC_EP_IN,   USB_ENDPOINT_ATTR_INTERRUPT,
+                  16, NULL);
+
     usbd_register_control_callback(dev,
         USB_REQ_TYPE_CLASS | USB_REQ_TYPE_INTERFACE,
         USB_REQ_TYPE_TYPE  | USB_REQ_TYPE_RECIPIENT,
@@ -232,7 +302,7 @@ static void cdc_suspend(void)
     usb_connected = false;
 }
 
-/* ---- public API ---- */
+/* ---- Public API ---- */
 
 int USInit(void)
 {
@@ -256,9 +326,12 @@ int USInit(void)
     usbd_register_set_config_callback(udev, cdc_setcfg);
     usbd_register_suspend_callback(udev, cdc_suspend);
 
-    /* Enable interrupt-driven USB so data arrives into InQ even while
-       the main thread is busy bit-banging the Pertec interface. */
+    /* Enable ISR-driven USB for both RX and TX. */
     nvic_enable_irq(NVIC_OTG_FS_IRQ);
+
+    TxQIn = 0;
+    TxQOut = 0;
+    TxActive = false;
 
     return 0;
 }
@@ -277,11 +350,11 @@ void USClear(void)
     InQOut = 0;
 }
 
+/* ---- RX functions ---- */
+
 /*  USGetchar – block until a byte is available.
- *  Calls usbd_poll explicitly (with ISR briefly disabled to avoid
- *  reentrancy) so this works even before the interrupt is active.
- *  During TapeWrite the ISR fills InQ in the background, so data
- *  is already waiting when we get here.
+ *  Calls usbd_poll with ISR disabled for early-init compatibility.
+ *  During TapeWrite the ISR fills InQ in the background.
  */
 int USGetchar(void)
 {
@@ -295,7 +368,6 @@ int USGetchar(void)
     return (unsigned char)c;
 }
 
-/*  USCharReady – non-blocking check.  */
 int USCharReady(void)
 {
     nvic_disable_irq(NVIC_OTG_FS_IRQ);
@@ -304,24 +376,90 @@ int USCharReady(void)
     return (InQIn != InQOut) ? 1 : 0;
 }
 
-/*  _usb_write_pkt – write one packet, guarded against ISR reentrancy.
- *  Spins until the endpoint accepts the data; briefly re-enables the
- *  interrupt between attempts so the ISR can process USB events
- *  (including TX completion that frees the FIFO).
+/*  USReadBlock – bulk read from InQ.
+ *  Uses memcpy on contiguous chunks for speed.
  */
-static void _usb_write_pkt(const uint8_t *buf, int len)
+int USReadBlock(uint8_t *Buf, int Count)
 {
-    int written;
-    do {
-        nvic_disable_irq(NVIC_OTG_FS_IRQ);
-        written = usbd_ep_write_packet(udev, USB_DATA_EP_IN, buf, len);
-        nvic_enable_irq(NVIC_OTG_FS_IRQ);
-    } while (written == 0);
+    while (Count > 0) {
+        while (InQIn == InQOut) {
+            nvic_disable_irq(NVIC_OTG_FS_IRQ);
+            usbd_poll(udev);
+            nvic_enable_irq(NVIC_OTG_FS_IRQ);
+        }
+        int in = InQIn;
+        int avail;
+        if (in >= InQOut)
+            avail = in - InQOut;
+        else
+            avail = INQ_SIZE - InQOut;
+        if (avail > Count)
+            avail = Count;
+        memcpy(Buf, &InQ[InQOut], avail);
+        Buf    += avail;
+        Count  -= avail;
+        InQOut += avail;
+        if (InQOut >= INQ_SIZE)
+            InQOut = 0;
+    }
+    return 0;
+}
+
+/* ---- TX functions ---- */
+
+/*  USWriteBlock – queue data for background USB transmission.
+ *  Copies into TxQ ring buffer via memcpy and returns immediately.
+ *  If TxQ is full, spins briefly waiting for ISR to drain it.
+ *  The ISR sends 64-byte packets from TxQ via tx_pump/tx_complete.
+ */
+int USWriteBlock(uint8_t *buf, int count)
+{
+    while (count > 0) {
+        int in  = TxQIn;
+        int out = TxQOut;   /* volatile read */
+
+        /* Available space (leave 1 slot for full/empty distinction). */
+        int space;
+        if (in >= out)
+            space = TXQ_SIZE - in + out - 1;
+        else
+            space = out - in - 1;
+
+        if (space == 0)
+            continue;       /* spin — ISR is draining TxQ */
+
+        int chunk = (count < space) ? count : space;
+
+        /* Copy with wrap-around handling. */
+        int toEnd = TXQ_SIZE - in;
+        if (toEnd >= chunk) {
+            memcpy(&TxQ[in], buf, chunk);
+        } else {
+            memcpy(&TxQ[in], buf, toEnd);
+            memcpy(&TxQ[0], buf + toEnd, chunk - toEnd);
+        }
+
+        in += chunk;
+        if (in >= TXQ_SIZE) in -= TXQ_SIZE;
+        TxQIn = in;       /* single volatile write */
+
+        buf   += chunk;
+        count -= chunk;
+
+        /* Kick the pump if it's idle. */
+        if (!TxActive) {
+            nvic_disable_irq(NVIC_OTG_FS_IRQ);
+            if (!TxActive)      /* double-check under IRQ lock */
+                tx_pump();
+            nvic_enable_irq(NVIC_OTG_FS_IRQ);
+        }
+    }
+    return 0;
 }
 
 int USWritechar(char c)
 {
-    _usb_write_pkt((const uint8_t *)&c, 1);
+    USWriteBlock((uint8_t *)&c, 1);
     return c;
 }
 
@@ -332,52 +470,7 @@ int USPutchar(char c)
 
 void USPuts(char *s)
 {
-    while (*s) USWritechar(*s++);
-}
-
-int USWriteBlock(uint8_t *buf, int count)
-{
-    while (count > 0) {
-        int pass = (count >= USB_PKT) ? USB_PKT : count;
-        _usb_write_pkt(buf, pass);
-        buf   += pass;
-        count -= pass;
-    }
-    return 0;
-}
-
-/*  USReadBlock – bulk read from InQ into a buffer.
- *  Copies contiguous chunks via memcpy instead of byte-by-byte.
- *  For a 10KB read with data already in InQ, this takes ~0.1ms
- *  vs ~3ms with per-byte USGetchar calls.
- */
-int USReadBlock(uint8_t *Buf, int Count)
-{
-    while (Count > 0) {
-        /* Wait for at least one byte. */
-        while (InQIn == InQOut) {
-            nvic_disable_irq(NVIC_OTG_FS_IRQ);
-            usbd_poll(udev);
-            nvic_enable_irq(NVIC_OTG_FS_IRQ);
-        }
-
-        /* Snapshot InQIn (volatile) once, then compute contiguous bytes. */
-        int in = InQIn;
-        int avail;
-        if (in >= InQOut)
-            avail = in - InQOut;
-        else
-            avail = INQ_SIZE - InQOut;  /* up to wrap point */
-
-        if (avail > Count)
-            avail = Count;
-
-        memcpy(Buf, &InQ[InQOut], avail);
-        Buf   += avail;
-        Count -= avail;
-        InQOut += avail;
-        if (InQOut >= INQ_SIZE)
-            InQOut = 0;
-    }
-    return 0;
+    int len = strlen(s);
+    if (len)
+        USWriteBlock((uint8_t *)s, len);
 }

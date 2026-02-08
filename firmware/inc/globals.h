@@ -17,9 +17,9 @@
 SCOPE volatile uint32_t Milliseconds;      // Just keeps counting
 
 
-//	Tape buffer - 65K bytes.
+//	Tape buffer - 32K bytes.
 
-#define TAPE_BUFFER_SIZE 65536
+#define TAPE_BUFFER_SIZE 32768
 
 SCOPE uint8_t __attribute__ ((aligned(4))) 
     TapeBuffer[TAPE_BUFFER_SIZE];
