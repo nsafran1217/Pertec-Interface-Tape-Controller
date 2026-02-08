@@ -26,7 +26,7 @@
 #include "comm.h"
 #include "gpiodef.h"
 #include "miscsubs.h"
-#include "rtcsubs.h"
+
 #include "globals.h"
 #include "tapeutil.h"
 #include "tapedriver.h"
@@ -569,7 +569,7 @@ void CmdCreateImage( char *args[])
   fileCount = 0;
   abort = false;
 
-  ShowRTCTime();
+ 
 
   while( true)
   { // read until done or abort
@@ -691,7 +691,7 @@ void CmdCreateImage( char *args[])
     TapeRewind();
     TapePosition = 0;		// we rewound the tape
   } // rewind if requested
-  ShowRTCTime();
+
   return;
 } // CmdCreateImage
 

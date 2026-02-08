@@ -13,7 +13,7 @@
 
 
 #include "comm.h"
-#include "rtcsubs.h"
+
 #include "gpiodef.h"
 #include "globals.h"
 
@@ -100,12 +100,6 @@ static void Init( void)
     
   Uprintf("\nTape Utility version " VERSION " ready...\n"
           "Enter \"HELP\" for a command description\n");
-
-//  Get the real-time clock going.
-
-  InitializeRTC();
-
-  Uprintf( "\nRTC initialized.\n");
 
 //  Get SDIO going.
 
