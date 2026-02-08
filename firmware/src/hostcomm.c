@@ -1,7 +1,3 @@
-
-/***********************************************************************
- * FILE: hostcomm.c
- ***********************************************************************/
 /*  Host communication implementation.
  *  Wraps USB serial with the binary packet protocol and provides
  *  stream read/write for image transfer operations.
@@ -32,8 +28,7 @@ void HostCommInit(void)
 
 void PktRecvExact(uint8_t *buf, uint32_t count)
 {
-    while (count--)
-        *buf++ = (uint8_t)USGetchar();
+    USReadBlock(buf, (int)count);
 }
 
 static void PktSendRaw(const uint8_t *buf, uint32_t count)

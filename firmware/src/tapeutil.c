@@ -379,6 +379,7 @@ static int ReadTapRecord(uint8_t *buf, uint32_t bufsize,
         return 0;
 
     if (h1 == 0) {
+        DBprintf("Tapemark at %d\n", TapePosition);
         *isTapemark = true;
         return 1;
     }
@@ -405,7 +406,6 @@ static int ReadTapRecord(uint8_t *buf, uint32_t bufsize,
 void HandleWriteImage(uint8_t flags)
 {
     bool noRewind = (flags & FLAG_NO_REWIND) != 0;
-    bool abort = false;
     int fileCount = 0;
     unsigned int tStatus = TSTAT_NOERR;
 
