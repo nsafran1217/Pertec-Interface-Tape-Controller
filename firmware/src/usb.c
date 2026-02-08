@@ -277,7 +277,7 @@ void USSendBlock(const uint8_t *Data, int Len)
     }
 }
 
-/* ---- Block receive (blocking) ----------------------------------- */
+/* ---- Block receive ---------------------------------------------- */
 
 static int ring_avail(void)
 {
@@ -285,16 +285,28 @@ static int ring_avail(void)
     return (d >= 0) ? d : d + RX_RING;
 }
 
-int USRecvBlock(uint8_t *Data, int MaxLen)
+static int recv_from_ring(uint8_t *Data, int MaxLen)
 {
-    /* Wait until at least 1 byte available */
-    while (ring_avail() == 0)
-        usbd_poll(usb_dev);
-
     int got = 0;
     while (got < MaxLen && ring_avail() > 0) {
         Data[got++] = rx_ring[rx_out++];
         if (rx_out >= RX_RING) rx_out = 0;
     }
     return got;
+}
+
+/* Blocking: waits until at least 1 byte, then drains up to MaxLen */
+int USRecvBlock(uint8_t *Data, int MaxLen)
+{
+    while (ring_avail() == 0)
+        usbd_poll(usb_dev);
+    return recv_from_ring(Data, MaxLen);
+}
+
+/* Non-blocking: polls USB once, returns however many bytes are available
+ * (may be 0) */
+int USRecvAvail(uint8_t *Data, int MaxLen)
+{
+    usbd_poll(usb_dev);
+    return recv_from_ring(Data, MaxLen);
 }

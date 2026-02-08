@@ -95,10 +95,13 @@ static void ProcessCommand(void)
     uint16_t pkt_len;
 
     while (1) {
-        SendPacket(PKT_READY, NULL, 0);
-
-        if (RecvPacket(&pkt_type, (uint8_t *)cmd_buf, &pkt_len) < 0)
-            continue;
+        /* Send PKT_READY and wait up to 500 ms for a command.
+         * If the host hasn't connected yet (or flushed its buffer on
+         * open), we simply re-send READY until it responds. */
+        do {
+            SendPacket(PKT_READY, NULL, 0);
+        } while (!TryRecvPacket(&pkt_type, (uint8_t *)cmd_buf,
+                                &pkt_len, 500));
 
         if (pkt_type != PKT_CMD || pkt_len == 0)
             continue;

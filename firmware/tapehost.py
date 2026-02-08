@@ -60,8 +60,10 @@ class Connection:
     def __init__(self, port: str, baudrate: int = 115200, timeout: float = 0.1):
         log.info("Opening %s at %d baud", port, baudrate)
         self.ser = serial.Serial(port, baudrate, timeout=timeout)
-        self.ser.reset_input_buffer()
-        self.ser.reset_output_buffer()
+        # Do NOT flush input — the controller may have already sent
+        # PKT_READY before we opened the port, and we need to see it.
+        # Any stale data from a previous session will be handled by
+        # wait_for_ready() which scans for a valid PKT_READY packet.
 
     def close(self):
         self.ser.close()
@@ -115,22 +117,42 @@ class Connection:
         log.info("Sending ESCAPE")
         self.send_packet(PKT_ESCAPE)
 
-    def wait_for_ready(self, timeout: float = 10.0):
-        """Block until the controller sends PKT_READY."""
+    def wait_for_ready(self, timeout: float = 15.0):
+        """Block until the controller sends PKT_READY.
+        
+        The controller re-sends READY every ~500 ms, so even if
+        stale data in the buffer causes a misparse we will eventually
+        synchronise.  On first connect we flush any stale bytes, then
+        look for a clean packet header.
+        """
         log.info("Waiting for controller READY...")
+
+        # Drain any stale data that accumulated before we opened.
+        time.sleep(0.1)
+        stale = self.ser.read(4096)
+        if stale:
+            log.debug("Discarded %d stale bytes", len(stale))
+
         deadline = time.monotonic() + timeout
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError("Controller did not become ready")
             try:
-                pkt_type, _ = self.recv_packet(timeout=remaining)
+                pkt_type, payload = self.recv_packet(
+                    timeout=min(remaining, 2.0))
                 if pkt_type == PKT_READY:
+                    log.info("Got READY from controller")
                     return
+                # Ignore MSG or other packets during startup
                 if pkt_type == PKT_MSG:
-                    pass  # ignore startup messages
-            except TimeoutError:
-                raise TimeoutError("Controller did not become ready")
+                    text = payload.decode("utf-8", errors="replace")
+                    log.debug("Startup message: %s", text.strip())
+            except (TimeoutError, struct.error, ValueError) as e:
+                # Misparse from stale data — flush and retry; the
+                # controller will send another READY shortly.
+                log.debug("Sync error during wait: %s — retrying", e)
+                self.ser.reset_input_buffer()
 
 
 # ---------------------------------------------------------------------------
@@ -402,6 +424,22 @@ def main():
             break
         if lower == "help":
             print(HELP_TEXT)
+            continue
+
+        # Wait for the controller to signal it is ready for a command.
+        # The firmware re-sends PKT_READY every ~500 ms, so even if
+        # we missed one we will catch the next.
+        try:
+            while True:
+                pkt_type, payload = conn.recv_packet(timeout=5.0)
+                if pkt_type == PKT_READY:
+                    break
+                if pkt_type == PKT_MSG:
+                    text = payload.decode("utf-8", errors="replace")
+                    print(text, end="", flush=True)
+                # Discard anything else (e.g. stale DONE)
+        except TimeoutError:
+            print("[WARN] Controller not ready — try again.")
             continue
 
         esc.start()

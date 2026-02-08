@@ -77,14 +77,18 @@ All MCU firmware files and the Python host application are below. **tapeutil.c r
 
 /*  Protocol packet layer above raw USB.
  *
- *  SendPacket  – blocking, returns when data is queued to USB.
- *  RecvPacket  – blocking, waits until a complete packet arrives.
- *  PollEscape  – non-blocking, returns true if PKT_ESCAPE received.
+ *  SendPacket      – blocking, returns when data is queued to USB.
+ *  RecvPacket      – blocking, waits until a complete packet arrives.
+ *  TryRecvPacket   – non-blocking with timeout (milliseconds).
+ *                    Returns true if a packet was received.
+ *  PollEscape      – non-blocking, returns true if PKT_ESCAPE received.
  */
 
 void  SendPacket(uint8_t Type, const uint8_t *Payload, uint16_t Len);
 int   RecvPacket(uint8_t *Type, uint8_t *Payload, uint16_t *Len);
-bool  PollEscape(void);         /* check & consume any pending ESCAPE */
+bool  TryRecvPacket(uint8_t *Type, uint8_t *Payload, uint16_t *Len,
+                    uint32_t TimeoutMs);
+bool  PollEscape(void);
 
 #endif /* HOSTCOMM_H */
 ```
@@ -98,6 +102,7 @@ bool  PollEscape(void);         /* check & consume any pending ESCAPE */
 #include "protocol.h"
 #include "hostcomm.h"
 #include "usbserial.h"
+#include "globals.h"            /* Milliseconds */
 
 /* ------------------------------------------------------------------ */
 /*  Low-level helpers                                                  */
@@ -108,6 +113,7 @@ static void SendRaw(const uint8_t *d, int n)
     USSendBlock(d, n);
 }
 
+/* Blocking receive of exactly n bytes */
 static void RecvRaw(uint8_t *d, int n)
 {
     int got = 0;
@@ -116,6 +122,21 @@ static void RecvRaw(uint8_t *d, int n)
         int r = USRecvBlock(d + got, n - got);
         got += r;
     }
+}
+
+/* Non-blocking receive: tries to collect n bytes within a deadline.
+ * Returns the number of bytes actually received. */
+static int RecvRawTimeout(uint8_t *d, int n, uint32_t deadline)
+{
+    int got = 0;
+    while (got < n)
+    {
+        if ((Milliseconds - deadline) < 0x80000000u)
+            break;                          /* deadline passed */
+        int r = USRecvAvail(d + got, n - got);
+        got += r;
+    }
+    return got;
 }
 
 /* ------------------------------------------------------------------ */
@@ -142,6 +163,31 @@ int RecvPacket(uint8_t *Type, uint8_t *Payload, uint16_t *Len)
     if (*Len && Payload)
         RecvRaw(Payload, *Len);
     return 0;
+}
+
+/* Non-blocking receive with timeout.  Returns true if a complete
+ * packet was received, false on timeout. */
+
+bool TryRecvPacket(uint8_t *Type, uint8_t *Payload, uint16_t *Len,
+                   uint32_t TimeoutMs)
+{
+    uint32_t deadline = Milliseconds + TimeoutMs;
+    uint8_t hdr[PKT_HEADER_SIZE];
+
+    /* Try to get the 3-byte header within the timeout */
+    int got = RecvRawTimeout(hdr, PKT_HEADER_SIZE, deadline);
+    if (got < PKT_HEADER_SIZE)
+        return false;                   /* timed out */
+
+    *Type = hdr[0];
+    *Len  = (uint16_t)hdr[1] | ((uint16_t)hdr[2] << 8);
+
+    /* Once we have a valid header, read the payload with a generous
+     * deadline — the sender is clearly alive at this point. */
+    if (*Len && Payload)
+        RecvRaw(Payload, *Len);
+
+    return true;
 }
 
 /* Escape flag – set asynchronously when an ESCAPE packet is found
@@ -385,7 +431,8 @@ void USClear(void);
 
 /* Block-level I/O for protocol layer */
 void USSendBlock(const uint8_t *Data, int Len);
-int  USRecvBlock(uint8_t *Data, int MaxLen);
+int  USRecvBlock(uint8_t *Data, int MaxLen);       /* blocking */
+int  USRecvAvail(uint8_t *Data, int MaxLen);       /* non-blocking */
 
 /* Non-blocking poll – drives USB stack, handles incoming data */
 void USPoll(void);
@@ -681,7 +728,7 @@ void USSendBlock(const uint8_t *Data, int Len)
     }
 }
 
-/* ---- Block receive (blocking) ----------------------------------- */
+/* ---- Block receive ---------------------------------------------- */
 
 static int ring_avail(void)
 {
@@ -689,18 +736,30 @@ static int ring_avail(void)
     return (d >= 0) ? d : d + RX_RING;
 }
 
-int USRecvBlock(uint8_t *Data, int MaxLen)
+static int recv_from_ring(uint8_t *Data, int MaxLen)
 {
-    /* Wait until at least 1 byte available */
-    while (ring_avail() == 0)
-        usbd_poll(usb_dev);
-
     int got = 0;
     while (got < MaxLen && ring_avail() > 0) {
         Data[got++] = rx_ring[rx_out++];
         if (rx_out >= RX_RING) rx_out = 0;
     }
     return got;
+}
+
+/* Blocking: waits until at least 1 byte, then drains up to MaxLen */
+int USRecvBlock(uint8_t *Data, int MaxLen)
+{
+    while (ring_avail() == 0)
+        usbd_poll(usb_dev);
+    return recv_from_ring(Data, MaxLen);
+}
+
+/* Non-blocking: polls USB once, returns however many bytes are available
+ * (may be 0) */
+int USRecvAvail(uint8_t *Data, int MaxLen)
+{
+    usbd_poll(usb_dev);
+    return recv_from_ring(Data, MaxLen);
 }
 ```
 
@@ -1027,10 +1086,13 @@ static void ProcessCommand(void)
     uint16_t pkt_len;
 
     while (1) {
-        SendPacket(PKT_READY, NULL, 0);
-
-        if (RecvPacket(&pkt_type, (uint8_t *)cmd_buf, &pkt_len) < 0)
-            continue;
+        /* Send PKT_READY and wait up to 500 ms for a command.
+         * If the host hasn't connected yet (or flushed its buffer on
+         * open), we simply re-send READY until it responds. */
+        do {
+            SendPacket(PKT_READY, NULL, 0);
+        } while (!TryRecvPacket(&pkt_type, (uint8_t *)cmd_buf,
+                                &pkt_len, 500));
 
         if (pkt_type != PKT_CMD || pkt_len == 0)
             continue;
@@ -1171,8 +1233,10 @@ class Connection:
     def __init__(self, port: str, baudrate: int = 115200, timeout: float = 0.1):
         log.info("Opening %s at %d baud", port, baudrate)
         self.ser = serial.Serial(port, baudrate, timeout=timeout)
-        self.ser.reset_input_buffer()
-        self.ser.reset_output_buffer()
+        # Do NOT flush input — the controller may have already sent
+        # PKT_READY before we opened the port, and we need to see it.
+        # Any stale data from a previous session will be handled by
+        # wait_for_ready() which scans for a valid PKT_READY packet.
 
     def close(self):
         self.ser.close()
@@ -1226,22 +1290,42 @@ class Connection:
         log.info("Sending ESCAPE")
         self.send_packet(PKT_ESCAPE)
 
-    def wait_for_ready(self, timeout: float = 10.0):
-        """Block until the controller sends PKT_READY."""
+    def wait_for_ready(self, timeout: float = 15.0):
+        """Block until the controller sends PKT_READY.
+        
+        The controller re-sends READY every ~500 ms, so even if
+        stale data in the buffer causes a misparse we will eventually
+        synchronise.  On first connect we flush any stale bytes, then
+        look for a clean packet header.
+        """
         log.info("Waiting for controller READY...")
+
+        # Drain any stale data that accumulated before we opened.
+        time.sleep(0.1)
+        stale = self.ser.read(4096)
+        if stale:
+            log.debug("Discarded %d stale bytes", len(stale))
+
         deadline = time.monotonic() + timeout
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError("Controller did not become ready")
             try:
-                pkt_type, _ = self.recv_packet(timeout=remaining)
+                pkt_type, payload = self.recv_packet(
+                    timeout=min(remaining, 2.0))
                 if pkt_type == PKT_READY:
+                    log.info("Got READY from controller")
                     return
+                # Ignore MSG or other packets during startup
                 if pkt_type == PKT_MSG:
-                    pass  # ignore startup messages
-            except TimeoutError:
-                raise TimeoutError("Controller did not become ready")
+                    text = payload.decode("utf-8", errors="replace")
+                    log.debug("Startup message: %s", text.strip())
+            except (TimeoutError, struct.error, ValueError) as e:
+                # Misparse from stale data — flush and retry; the
+                # controller will send another READY shortly.
+                log.debug("Sync error during wait: %s — retrying", e)
+                self.ser.reset_input_buffer()
 
 
 # ---------------------------------------------------------------------------
@@ -1513,6 +1597,22 @@ def main():
             break
         if lower == "help":
             print(HELP_TEXT)
+            continue
+
+        # Wait for the controller to signal it is ready for a command.
+        # The firmware re-sends PKT_READY every ~500 ms, so even if
+        # we missed one we will catch the next.
+        try:
+            while True:
+                pkt_type, payload = conn.recv_packet(timeout=5.0)
+                if pkt_type == PKT_READY:
+                    break
+                if pkt_type == PKT_MSG:
+                    text = payload.decode("utf-8", errors="replace")
+                    print(text, end="", flush=True)
+                # Discard anything else (e.g. stale DONE)
+        except TimeoutError:
+            print("[WARN] Controller not ready — try again.")
             continue
 
         esc.start()
