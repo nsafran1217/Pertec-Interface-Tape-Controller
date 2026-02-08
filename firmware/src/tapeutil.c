@@ -1,6 +1,3 @@
-/***********************************************************************
- * FILE: tapeutil.c  (rewritten for host protocol)
- ***********************************************************************/
 /*  Tape Utilities – host-controlled version.
  *  Low-level tape I/O is still in tapedriver.c.
  *  File I/O is replaced by streaming over USB via hostcomm.
@@ -354,54 +351,13 @@ void HandleCreateImage(uint8_t flags)
 /* ================================================================
  * HandleWriteImage – receive TAP image from host, write to tape.
  *
- * Double-buffered pipeline:
- *   buf[cur] has the record about to be written (already parsed).
- *   buf[nxt] has the NEXT record (already parsed).
- *   After TapeWrite(buf[cur]), we read-ahead into buf[cur] (now free)
- *   for two iterations from now, then swap.  TapeWrite always starts
- *   immediately with a fully-parsed record — zero stall.
+ * Simple pipeline:
+ *   1. Read next TAP record from stream into TapeBuffer
+ *   2. StreamPrefetch — requests next chunk if running low,
+ *      so the host's response arrives via ISR during TapeWrite
+ *   3. TapeWrite — ISR fills InQ in background
+ *   4. Repeat
  * ================================================================ */
-
-static int ReadTapRecord(uint8_t *buf, uint32_t bufsize,
-                         uint32_t *recLen, bool *isTapemark)
-{
-    uint32_t h1, h2, br;
-    int sr;
-
-    *recLen = 0;
-    *isTapemark = false;
-
-    sr = StreamRead(&h1, sizeof(h1), &br);
-    if (sr != 0 || br != sizeof(h1))
-        return 0;
-
-    if (h1 == TAP_EOM)
-        return 0;
-
-    if (h1 == 0) {
-        DBprintf("Tapemark at %d\n", TapePosition);
-        *isTapemark = true;
-        return 1;
-    }
-
-    uint32_t bcount = h1 & TAP_LENGTH_MASK;
-    if (bcount > bufsize)
-        return -1;
-
-    sr = StreamRead(buf, bcount, &br);
-    if (sr != 0 || br != bcount)
-        return -1;
-
-    sr = StreamRead(&h2, sizeof(h2), &br);
-    if (sr != 0 || br != sizeof(h2))
-        return -1;
-
-    if (h1 != h2)
-        return -1;
-
-    *recLen = bcount;
-    return 1;
-}
 
 void HandleWriteImage(uint8_t flags)
 {
@@ -432,54 +388,61 @@ void HandleWriteImage(uint8_t flags)
 
     StreamReset();
 
-#define HALF_BUF (TAPE_BUFFER_SIZE / 2)
-    uint8_t  *buf[2]    = { TapeBuffer, TapeBuffer + HALF_BUF };
-    uint32_t  recLen[2]  = { 0, 0 };
-    bool      isTM[2]    = { false, false };
-    int       cur = 0, nxt = 1;
-    bool      hasNext;
-    int       rr;
-
-    /* Pre-read first two records (tape is stopped, blocking is fine). */
-    rr = ReadTapRecord(buf[0], HALF_BUF, &recLen[0], &isTM[0]);
-    if (rr <= 0)
-        goto done;
-
-    rr = ReadTapRecord(buf[1], HALF_BUF, &recLen[1], &isTM[1]);
-    hasNext = (rr > 0);
-
     while (true) {
-        /* Prefetch so next chunk arrives via ISR during TapeWrite. */
-        StreamPrefetch();
+        
+        uint32_t h1, h2, br;
+        uint32_t bcount;
+        int sr;
 
-        /* Write buf[cur] — already fully parsed, starts immediately. */
-        tStatus = TapeWrite(buf[cur], isTM[cur] ? 0 : (int)recLen[cur]);
+        /* Read TAP header (4 bytes). */
+        sr = StreamRead(&h1, sizeof(h1), &br);
+        if (sr != 0 || br != sizeof(h1))
+            break;
+
+        if (h1 == TAP_EOM)
+            break;
+
         TapePosition++;
-        if (isTM[cur]) fileCount++;
-        AddRecordCount(isTM[cur] ? 0 : recLen[cur]);
+
+        if (h1 != 0) {
+            /* Data block: read data + trailer, validate. */
+            bool corrupt = true;
+            bcount = h1 & TAP_LENGTH_MASK;
+
+            if (bcount <= TAPE_BUFFER_SIZE) {
+                sr = StreamRead(TapeBuffer, bcount, &br);
+                if (sr == 0 && br == bcount) {
+                    sr = StreamRead(&h2, sizeof(h2), &br);
+                    if (sr == 0 && br == sizeof(h2) && h1 == h2)
+                        corrupt = false;
+                }
+            }
+
+            if (corrupt) {
+                SendMsgF("Image file corrupt at block %d.", TapePosition);
+                break;
+            }
+
+            /* Prefetch: if stream buffer is running low, request
+               next chunk NOW so it arrives during TapeWrite. */
+            StreamPrefetch();
+            tStatus = TapeWrite(TapeBuffer, bcount);
+        } else {
+            /* Tapemark (zero-length). */
+            DBprintf("Tapemark at block %d.\n", TapePosition);
+            StreamPrefetch();
+            tStatus = TapeWrite(TapeBuffer, 0);
+            fileCount++;
+        }
+
+        AddRecordCount(h1 ? (h1 & TAP_LENGTH_MASK) : 0);
 
         if (tStatus != TSTAT_NOERR) {
             SendMsg("Tape write error");
             break;
         }
-
-        if (!hasNext)
-            break;            /* buf[nxt] was the last record */
-
-        /* Read ahead into buf[cur] (just written, now free).
-           Data should be in InQ already from prefetch + ISR. */
-        rr = ReadTapRecord(buf[cur], HALF_BUF, &recLen[cur], &isTM[cur]);
-        if (rr < 0) {
-            SendMsgF("Image file corrupt at block %d.", TapePosition);
-            break;
-        }
-        hasNext = (rr > 0);
-
-        /* Swap: nxt becomes current, cur (just read-ahead) becomes nxt. */
-        { int tmp = cur; cur = nxt; nxt = tmp; }
     }
 
-done:
     FlushRecordCount();
 
     if (!noRewind) {
