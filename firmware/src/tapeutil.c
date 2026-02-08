@@ -389,7 +389,7 @@ void HandleWriteImage(uint8_t flags)
     StreamReset();
 
     while (true) {
-        
+        DBprintf("%d\n", TapePosition);
         uint32_t h1, h2, br;
         uint32_t bcount;
         int sr;
@@ -437,10 +437,13 @@ void HandleWriteImage(uint8_t flags)
 
         AddRecordCount(h1 ? (h1 & TAP_LENGTH_MASK) : 0);
 
-        if (tStatus != TSTAT_NOERR) {
+        if (tStatus & TSTAT_CORRERR)
+            DBprintf("At block %d, an error was auto-corrected.", TapePosition);
+        if (tStatus == TSTAT_HARDERR) {
             SendMsg("Tape write error");
             break;
         }
+        
     }
 
     FlushRecordCount();
