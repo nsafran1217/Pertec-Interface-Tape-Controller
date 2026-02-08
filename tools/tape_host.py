@@ -319,32 +319,39 @@ class TapeController:
         if t != RSP_OK:
             raise RuntimeError(f"Unexpected response 0x{t:02X}")
 
-        # Send entire file as back-to-back CMD_FILE_DATA packets.
-        # USB hardware NAK provides flow control — pyserial's write
-        # blocks when the MCU can't accept more data.
-        CHUNK = 4096
+        # MCU drives the flow: it sends RSP_READY when it needs data,
+        # we respond with a CMD_FILE_DATA chunk (or CMD_FILE_EOF).
+        # Large chunks (16KB) keep the MCU's InQ primed so the next
+        # tape record is ready as soon as TapeWrite finishes.
+        CHUNK = 16384
+        eof_sent = False
         try:
             with open(filename, "rb") as f:
                 while True:
-                    chunk = f.read(CHUNK)
-                    if not chunk:
-                        break
-                    self.link.send_pkt(CMD_FILE_DATA, chunk)
-            self.link.send_pkt(CMD_FILE_EOF)
+                    t, p = self.link.recv_pkt(timeout=300)
+                    if t == RSP_READY:
+                        if eof_sent:
+                            continue   # drain any extra RSP_READY
+                        chunk = f.read(CHUNK)
+                        if chunk:
+                            self.link.send_pkt(CMD_FILE_DATA, chunk)
+                        else:
+                            self.link.send_pkt(CMD_FILE_EOF)
+                            eof_sent = True
+                    elif t == RSP_IMG_DONE:
+                        return self._parse_img_done(p, 0)
+                    elif t == RSP_ERROR:
+                        msg = p[2:].decode("ascii", errors="replace") \
+                              if len(p) > 2 else ""
+                        raise RuntimeError(f"Error during write: {msg}")
+                    # RSP_MSG is handled transparently by recv_pkt
         except KeyboardInterrupt:
             print("\nSending abort...")
             self.link.send_pkt(CMD_ABORT)
-
-        # Wait for MCU to finish processing and send completion summary.
-        # This may take a while as the MCU writes remaining data to tape.
-        while True:
-            t, p = self.link.recv_pkt(timeout=300)
-            if t == RSP_IMG_DONE:
-                return self._parse_img_done(p, 0)
-            if t == RSP_ERROR:
-                msg = p[2:].decode("ascii", errors="replace") \
-                      if len(p) > 2 else ""
-                raise RuntimeError(f"Error: {msg}")
+            while True:
+                t, p = self.link.recv_pkt(timeout=30)
+                if t == RSP_IMG_DONE:
+                    return self._parse_img_done(p, 0)
 
     @staticmethod
     def _parse_img_done(payload, local_bytes):

@@ -363,10 +363,10 @@ int StreamWrite(const void *data, uint32_t count, uint32_t *written)
 }
 
 /*  StreamRead – receive image data from host (used during CmdWriteImage).
- *  The host sends CMD_FILE_DATA packets back-to-back after RSP_OK,
- *  terminated by CMD_FILE_EOF.  USB hardware NAK provides flow control.
- *  The MCU simply blocks until the next packet arrives when its local
- *  buffer runs out.
+ *  Uses RSP_READY handshake: MCU requests a chunk, host sends one.
+ *  Large chunk size (host sends ~16KB at a time) keeps the InQ primed
+ *  so the next record is ready as soon as TapeWrite finishes.
+ *  The ISR fills InQ in the background during TapeWrite.
  *  Returns: 0 = ok, 1 = EOF, -1 = abort.
  */
 int StreamRead(void *data, uint32_t count, uint32_t *bytesRead)
@@ -386,7 +386,10 @@ int StreamRead(void *data, uint32_t count, uint32_t *bytesRead)
         }
         else
         {
-            /* Wait for next packet from host (blocking). */
+            /* Request next chunk from host. */
+            PktSend(RSP_READY, NULL, 0);
+
+            /* Wait for host response. */
             uint8_t hdr[PKT_HDR_SIZE];
             PktRecvExact(hdr, PKT_HDR_SIZE);
             uint8_t type = hdr[0];
