@@ -24,6 +24,7 @@
 #include "pertbits.h"
 #include "tap.h"
 #include "usbserial.h"
+#include "dbserial.h"
 
 /* --- local state --- */
 
@@ -396,7 +397,7 @@ void HandleWriteImage(uint8_t flags)
             break;
 
         TapePosition++;
-
+        DBprintf("Receiving block at position %d\n", TapePosition);
         if (h1 != 0) {
             /* data block */
             bool corrupt = true;

@@ -730,12 +730,18 @@ void USClear(void)
 }
 
 /*  USGetchar – block until a byte is available.
- *  The ISR fills InQ via cdc_rx, so no explicit usbd_poll needed.
+ *  Calls usbd_poll explicitly (with ISR briefly disabled to avoid
+ *  reentrancy) so this works even before the interrupt is active.
+ *  During TapeWrite the ISR fills InQ in the background, so data
+ *  is already waiting when we get here.
  */
 int USGetchar(void)
 {
-    while (InQIn == InQOut)
-        ;                       /* ISR fills InQ in background */
+    while (InQIn == InQOut) {
+        nvic_disable_irq(NVIC_OTG_FS_IRQ);
+        usbd_poll(udev);
+        nvic_enable_irq(NVIC_OTG_FS_IRQ);
+    }
     char c = InQ[InQOut++];
     if (InQOut >= INQ_SIZE) InQOut = 0;
     return (unsigned char)c;
@@ -744,6 +750,9 @@ int USGetchar(void)
 /*  USCharReady – non-blocking check.  */
 int USCharReady(void)
 {
+    nvic_disable_irq(NVIC_OTG_FS_IRQ);
+    usbd_poll(udev);
+    nvic_enable_irq(NVIC_OTG_FS_IRQ);
     return (InQIn != InQOut) ? 1 : 0;
 }
 
