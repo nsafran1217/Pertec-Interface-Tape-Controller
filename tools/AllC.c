@@ -85,6 +85,7 @@ void SendImgDone(uint32_t blocks, uint32_t files, uint32_t bytes, uint8_t aborte
 void StreamReset(void);
 int  StreamWrite(const void *data, uint32_t count, uint32_t *written);
 int  StreamRead(void *data, uint32_t count, uint32_t *bytesRead);
+void StreamPrefetch(void);
 
 /* --- Abort check (replaces CheckForEscape) --- */
 bool CheckAbort(void);
@@ -110,8 +111,9 @@ bool CheckAbort(void);
 #include "usbserial.h"
 
 /* Stream state for image read/write */
-static uint32_t sAvail;   /* bytes remaining in current incoming packet */
-static bool     sEOF;     /* host signalled end-of-file */
+static uint32_t sAvail;       /* bytes remaining in current incoming packet */
+static bool     sEOF;         /* host signalled end-of-file */
+static bool     sPrefetched;  /* RSP_READY already sent, awaiting response */
 
 void HostCommInit(void)
 {
@@ -349,6 +351,7 @@ void StreamReset(void)
 {
     sAvail = 0;
     sEOF = false;
+    sPrefetched = false;
 }
 
 /*  StreamWrite – send image data to host (used during CmdCreateImage).
@@ -364,9 +367,8 @@ int StreamWrite(const void *data, uint32_t count, uint32_t *written)
 
 /*  StreamRead – receive image data from host (used during CmdWriteImage).
  *  Uses RSP_READY handshake: MCU requests a chunk, host sends one.
- *  Large chunk size (host sends ~16KB at a time) keeps the InQ primed
- *  so the next record is ready as soon as TapeWrite finishes.
- *  The ISR fills InQ in the background during TapeWrite.
+ *  If StreamPrefetch was called beforehand, the request was already sent
+ *  so we just wait for the response (data may already be in InQ via ISR).
  *  Returns: 0 = ok, 1 = EOF, -1 = abort.
  */
 int StreamRead(void *data, uint32_t count, uint32_t *bytesRead)
@@ -386,10 +388,12 @@ int StreamRead(void *data, uint32_t count, uint32_t *bytesRead)
         }
         else
         {
-            /* Request next chunk from host. */
-            PktSend(RSP_READY, NULL, 0);
+            /* Request next chunk if not already prefetched. */
+            if (!sPrefetched)
+                PktSend(RSP_READY, NULL, 0);
+            sPrefetched = false;
 
-            /* Wait for host response. */
+            /* Wait for host response — may already be in InQ. */
             uint8_t hdr[PKT_HDR_SIZE];
             PktRecvExact(hdr, PKT_HDR_SIZE);
             uint8_t type = hdr[0];
@@ -414,6 +418,20 @@ int StreamRead(void *data, uint32_t count, uint32_t *bytesRead)
     }
     *bytesRead = count - remaining;
     return sEOF ? 1 : 0;
+}
+
+/*  StreamPrefetch – request next chunk from host NOW.
+ *  Call this before a long operation (e.g. TapeWrite) so that
+ *  the host's response arrives via ISR during the operation.
+ *  The next StreamRead will find data already in InQ.
+ */
+void StreamPrefetch(void)
+{
+    if (sAvail == 0 && !sEOF && !sPrefetched)
+    {
+        PktSend(RSP_READY, NULL, 0);
+        sPrefetched = true;
+    }
 }
 
 /*  CheckAbort – non-blocking check for CMD_ABORT from host. */
@@ -1273,6 +1291,9 @@ void HandleWriteImage(uint8_t flags)
                     sr = StreamRead(&h2, sizeof(h2), &br);
                     if (sr == 0 && br == sizeof(h2) && h1 == h2) {
                         corrupt = false;
+                        /* Pre-fetch next chunk so it arrives via ISR
+                           during TapeWrite — keeps the tape streaming. */
+                        StreamPrefetch();
                         tStatus = TapeWrite(TapeBuffer, bcount);
                     }
                 }
@@ -1283,6 +1304,7 @@ void HandleWriteImage(uint8_t flags)
             }
         } else {
             /* tapemark */
+            StreamPrefetch();
             tStatus = TapeWrite(TapeBuffer, 0);
             fileCount++;
         }

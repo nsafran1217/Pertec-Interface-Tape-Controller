@@ -397,7 +397,7 @@ void HandleWriteImage(uint8_t flags)
             break;
 
         TapePosition++;
-        DBprintf("Receiving block at position %d\n", TapePosition);
+        //DBprintf("Receiving block at position %d\n", TapePosition);
         if (h1 != 0) {
             /* data block */
             bool corrupt = true;
@@ -409,17 +409,21 @@ void HandleWriteImage(uint8_t flags)
                     sr = StreamRead(&h2, sizeof(h2), &br);
                     if (sr == 0 && br == sizeof(h2) && h1 == h2) {
                         corrupt = false;
+                        /* Pre-fetch next chunk so it arrives via ISR
+                           during TapeWrite — keeps the tape streaming. */
+                        StreamPrefetch();
                         tStatus = TapeWrite(TapeBuffer, bcount);
                     }
                 }
             }
             if (corrupt) {
-                SendMsgF("Image file corrupt at block %d.", TapePosition);
+                DBprintf("Image file corrupt at block %d.", TapePosition);
                 break;
             }
         } else {
             /* tapemark */
-            SendMsgF( "Filemark hit at %d", TapePosition);
+            StreamPrefetch();
+            DBprintf("Filemark at block %d\n", TapePosition);
             tStatus = TapeWrite(TapeBuffer, 0);
             fileCount++;
         }
@@ -430,7 +434,6 @@ void HandleWriteImage(uint8_t flags)
             SendMsg("Tape write error");
             break;
         }
-
     }
 
     FlushRecordCount();
