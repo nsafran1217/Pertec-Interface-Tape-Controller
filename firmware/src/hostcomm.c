@@ -1,6 +1,10 @@
 /*  Host communication implementation.
  *  Wraps USB serial with the binary packet protocol and provides
  *  stream read/write for image transfer operations.
+ *
+ *  Write-to-tape streaming uses credit-based flow control:
+ *  the MCU keeps 2 RSP_READY "credits" in flight so the host
+ *  always has one chunk in transit while the MCU consumes the other.
  */
 
 #include <stdint.h>
@@ -15,7 +19,11 @@
 /* Stream state for image read/write */
 static uint32_t sAvail;       /* bytes remaining in current incoming packet */
 static bool     sEOF;         /* host signalled end-of-file */
-static bool     sPrefetched;  /* RSP_READY already sent, awaiting response */
+static int      sCredits;     /* RSP_READY sent but not yet answered */
+
+/* Pipeline depth: how many RSP_READY credits to keep in flight.
+ * With 16KB chunks, 2 credits = up to 32KB in InQ (fits in 48KB). */
+#define MAX_CREDITS 2
 
 void HostCommInit(void)
 {
@@ -64,7 +72,6 @@ int PktRecv(uint8_t *type, uint8_t *data, uint32_t maxlen, uint32_t *len)
          | ((uint32_t)hdr[4] << 24);
     if (*len > maxlen)
     {
-        /* drain oversized payload */
         uint32_t rem = *len;
         uint8_t tmp;
         while (rem--) PktRecvExact(&tmp, 1);
@@ -98,14 +105,7 @@ void SendMsg(const char *msg)
     PktSend(RSP_MSG, (const uint8_t *)msg, strlen(msg));
 }
 
-/*  SendMsgF – printf-style message sender.
- *  Supports the same format specifiers as the original Uprintf:
- *    %d   - unsigned decimal
- *    %x   - unsigned hex (lowercase)
- *    %c   - single character
- *    %s   - string
- *  Width and leading-zero modifiers work: %04x, %8d, etc.
- */
+/* ---- SendMsgF ---- */
 
 static void MsgNumout(char *buf, int *pos, int max,
                       unsigned num, int dig, int radix, int bwz)
@@ -171,17 +171,14 @@ void SendMsgF(const char *fmt, ...)
             u = va_arg(ap, unsigned int);
             MsgNumout(buf, &pos, max, u, width, 10, bwz);
             break;
-
         case 'x':
             u = va_arg(ap, unsigned int);
             MsgNumout(buf, &pos, max, u, width, 16, bwz);
             break;
-
         case 'c':
             i = va_arg(ap, int);
             if (pos < max - 1) buf[pos++] = (char)i;
             break;
-
         case 's':
             s = va_arg(ap, char *);
             if (!width) {
@@ -191,7 +188,7 @@ void SendMsgF(const char *fmt, ...)
                 int slen = strlen(s);
                 i = slen - width;
                 if (i >= 0) {
-                    s += i;  /* truncate from left */
+                    s += i;
                     while (*s && pos < max - 1)
                         buf[pos++] = *s++;
                 } else {
@@ -202,7 +199,6 @@ void SendMsgF(const char *fmt, ...)
                 }
             }
             break;
-
         default:
             if (pos < max - 1) buf[pos++] = *p;
             break;
@@ -211,7 +207,6 @@ void SendMsgF(const char *fmt, ...)
 
     va_end(ap);
     buf[pos] = 0;
-
     PktSend(RSP_MSG, (const uint8_t *)buf, pos);
 }
 
@@ -246,19 +241,24 @@ void SendImgDone(uint32_t blocks, uint32_t files, uint32_t bytes, uint8_t aborte
     PktSend(RSP_IMG_DONE, buf, 13);
 }
 
-/* ---- Stream I/O (virtual file replacement) ---- */
+/* ---- Stream I/O ---- */
 
 void StreamReset(void)
 {
     sAvail = 0;
     sEOF = false;
-    sPrefetched = false;
+    sCredits = 0;
 }
 
-/*  StreamWrite – send image data to host (used during CmdCreateImage).
- *  Data is sent as RSP_IMG_DATA packets.
- *  Returns 0 on success.
- */
+/*  Send RSP_READY credits up to MAX_CREDITS outstanding. */
+static void StreamFillPipeline(void)
+{
+    while (sCredits < MAX_CREDITS && !sEOF) {
+        PktSend(RSP_READY, NULL, 0);
+        sCredits++;
+    }
+}
+
 int StreamWrite(const void *data, uint32_t count, uint32_t *written)
 {
     PktSend(RSP_IMG_DATA, (const uint8_t *)data, count);
@@ -266,16 +266,23 @@ int StreamWrite(const void *data, uint32_t count, uint32_t *written)
     return 0;
 }
 
-/*  StreamRead – receive image data from host (used during CmdWriteImage).
- *  Uses RSP_READY handshake: MCU requests a chunk, host sends one.
- *  If StreamPrefetch was called beforehand, the request was already sent
- *  so we just wait for the response (data may already be in InQ via ISR).
+/*  StreamRead – receive image data from host.
+ *
+ *  Credit-based flow control:
+ *  - On first call, sends MAX_CREDITS RSP_READY tokens
+ *  - Each time a packet is consumed, sends another RSP_READY
+ *  - This keeps one chunk arriving while one is being consumed
+ *  - During TapeWrite, the ISR receives the in-flight chunk into InQ
+ *
  *  Returns: 0 = ok, 1 = EOF, -1 = abort.
  */
 int StreamRead(void *data, uint32_t count, uint32_t *bytesRead)
 {
     uint8_t *p = (uint8_t *)data;
     uint32_t remaining = count;
+
+    /* Ensure pipeline is primed on first call. */
+    StreamFillPipeline();
 
     while (remaining > 0 && !sEOF)
     {
@@ -289,12 +296,8 @@ int StreamRead(void *data, uint32_t count, uint32_t *bytesRead)
         }
         else
         {
-            /* Request next chunk if not already prefetched. */
-            if (!sPrefetched)
-                PktSend(RSP_READY, NULL, 0);
-            sPrefetched = false;
-
-            /* Wait for host response — may already be in InQ. */
+            /* Current packet exhausted. Wait for next one
+               (should already be in InQ from pipelined credit). */
             uint8_t hdr[PKT_HDR_SIZE];
             PktRecvExact(hdr, PKT_HDR_SIZE);
             uint8_t type = hdr[0];
@@ -302,6 +305,8 @@ int StreamRead(void *data, uint32_t count, uint32_t *bytesRead)
                           | ((uint32_t)hdr[2] << 8)
                           | ((uint32_t)hdr[3] << 16)
                           | ((uint32_t)hdr[4] << 24);
+
+            sCredits--;   /* one credit consumed */
 
             if (type == CMD_FILE_EOF)
             {
@@ -313,26 +318,17 @@ int StreamRead(void *data, uint32_t count, uint32_t *bytesRead)
                 *bytesRead = count - remaining;
                 return -1;
             }
-            /* CMD_FILE_DATA – payload bytes follow */
+
+            /* CMD_FILE_DATA – start consuming this packet. */
             sAvail = plen;
+
+            /* Immediately refill pipeline so next chunk is
+               already in transit (arrives via ISR during TapeWrite). */
+            StreamFillPipeline();
         }
     }
     *bytesRead = count - remaining;
     return sEOF ? 1 : 0;
-}
-
-/*  StreamPrefetch – request next chunk from host NOW.
- *  Call this before a long operation (e.g. TapeWrite) so that
- *  the host's response arrives via ISR during the operation.
- *  The next StreamRead will find data already in InQ.
- */
-void StreamPrefetch(void)
-{
-    if (sAvail == 0 && !sEOF && !sPrefetched)
-    {
-        PktSend(RSP_READY, NULL, 0);
-        sPrefetched = true;
-    }
 }
 
 /*  CheckAbort – non-blocking check for CMD_ABORT from host. */

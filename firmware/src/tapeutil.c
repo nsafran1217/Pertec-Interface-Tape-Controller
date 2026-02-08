@@ -265,7 +265,7 @@ void HandleCreateImage(uint8_t flags)
     while (true) {
         unsigned int readStat;
         int readCount;
-
+        DBprintf("%d\n", TapePosition);
         if ((abort = CheckAbort()))
             break;
 
@@ -389,7 +389,7 @@ void HandleWriteImage(uint8_t flags)
     StreamReset();
 
     while (true) {
-        DBprintf("%d\n", TapePosition);
+        //DBprintf("%d\n", TapePosition);
         uint32_t h1, h2, br;
         uint32_t bcount;
         int sr;
@@ -423,14 +423,10 @@ void HandleWriteImage(uint8_t flags)
                 break;
             }
 
-            /* Prefetch: if stream buffer is running low, request
-               next chunk NOW so it arrives during TapeWrite. */
-            StreamPrefetch();
             tStatus = TapeWrite(TapeBuffer, bcount);
         } else {
             /* Tapemark (zero-length). */
-            DBprintf("Tapemark at block %d.\n", TapePosition);
-            StreamPrefetch();
+            DBprintf( "Filemark hit at %d\n", TapePosition);
             tStatus = TapeWrite(TapeBuffer, 0);
             fileCount++;
         }
@@ -438,12 +434,11 @@ void HandleWriteImage(uint8_t flags)
         AddRecordCount(h1 ? (h1 & TAP_LENGTH_MASK) : 0);
 
         if (tStatus & TSTAT_CORRERR)
-            DBprintf("At block %d, an error was auto-corrected.", TapePosition);
+            DBprintf("Block %d: SOFT_ERR\n", TapePosition);
         if (tStatus == TSTAT_HARDERR) {
-            SendMsg("Tape write error");
+            SendMsgF("Tape write error at block %d.", TapePosition);
             break;
         }
-        
     }
 
     FlushRecordCount();

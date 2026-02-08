@@ -1,7 +1,3 @@
-/***********************************************************************
- * FILE: hostcomm.h
- * Host communication layer - packet send/receive and stream I/O.
- ***********************************************************************/
 #ifndef _HOSTCOMM_H
 #define _HOSTCOMM_H
 
@@ -27,7 +23,6 @@ void SendImgDone(uint32_t blocks, uint32_t files, uint32_t bytes, uint8_t aborte
 void StreamReset(void);
 int  StreamWrite(const void *data, uint32_t count, uint32_t *written);
 int  StreamRead(void *data, uint32_t count, uint32_t *bytesRead);
-void StreamPrefetch(void);
 
 /* --- Abort check (replaces CheckForEscape) --- */
 bool CheckAbort(void);

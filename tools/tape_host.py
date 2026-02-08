@@ -323,7 +323,7 @@ class TapeController:
         # we respond with a CMD_FILE_DATA chunk (or CMD_FILE_EOF).
         # Large chunks (16KB) keep the MCU's InQ primed so the next
         # tape record is ready as soon as TapeWrite finishes.
-        CHUNK = 32768
+        CHUNK = 12288
         eof_sent = False
         try:
             with open(filename, "rb") as f:
