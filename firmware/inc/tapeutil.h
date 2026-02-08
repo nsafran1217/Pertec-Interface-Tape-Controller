@@ -1,22 +1,25 @@
+/***********************************************************************
+ * FILE: tapeutil.h  (updated signatures)
+ ***********************************************************************/
 #ifndef _TAPEUTIL_INC
 #define _TAPEUTIL_INC
 
-//	Prototypes.
+#include <stdint.h>
 
-void ShowBriefStatus (void);
-void CmdShowStatus( char *args[]);
-void CmdSetAddr( char *args[]);
-void CmdSetRetries( char *args[]);
-void CmdSetStop( char *args[]);
-void CmdInitTape( char *args[]);
-void CmdRewindTape( char *args[]);
-void CmdUnloadTape( char *args[]);
-void CmdReadForward( char *args[]);
-void CmdSkip( char *args[]);
-void CmdSpace( char *args[]);
-void CmdTapeDebug( char *args[]);
-void CmdCreateImage( char *args[]);
-void CmdWriteImage( char *args[]);
-void CmdSet1600( char *args[]);
-void CmdSet6250( char *args[]);
+void HandleStatus(void);
+void HandleInit(void);
+void HandleRewind(void);
+void HandleUnload(void);
+void HandleReadForward(uint8_t flags);
+void HandleSkip(int16_t count);
+void HandleSpace(int16_t count);
+void HandleSetAddr(uint8_t addr);
+void HandleSetRetries(uint8_t count);
+void HandleSetStop(uint8_t mode, uint8_t stopOnError);
+void HandleDebug(uint16_t cmd);
+void HandleCreateImage(uint8_t flags);
+void HandleWriteImage(uint8_t flags);
+void HandleSet1600(void);
+void HandleSet6250(void);
+
 #endif

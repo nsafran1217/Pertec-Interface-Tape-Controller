@@ -4,7 +4,6 @@
 //void LedCtrl( unsigned int LED, int Func);
 
 void InitGPIO( void);
-void ShowBuffer( uint8_t *Buf, int Buflen, bool Ebcdic);
 void DelaySetup (void);
 void Delay(uint16_t Howmuch);
 void SetupSysTick( void);

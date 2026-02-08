@@ -9,9 +9,6 @@
 #define SCOPE
 #endif
 
-#ifndef BLOCK_SIZE
-#define BLOCK_SIZE 512
-#endif
 
 #define NO_OP {}          // avoids misplaced semicolons
 
@@ -19,10 +16,6 @@
 
 SCOPE volatile uint32_t Milliseconds;      // Just keeps counting
 
-//  Common Buffer.
-
-SCOPE uint8_t __attribute__ ((aligned(4)))
-    Buffer[BLOCK_SIZE]; // buffer block size
 
 //	Tape buffer - 65K bytes.
 

@@ -13,11 +13,9 @@
 
 #include "license.h"
 
-#include "comm.h"
 #include "gpiodef.h"
 #include "globals.h"
 #include "miscsubs.h"
-#include "ebcdic.h"
 
 static void SetupGPIO( uint32_t Gpio, uint16_t Pin, 
                       uint8_t Mode, uint8_t Pull, int Initial);
@@ -49,9 +47,6 @@ void InitGPIO( void)
 
   GPIO_INIT( LED);		// two LEDs
   GPIO_INIT( USART);		// USART Rx, Tx
-  GPIO_INIT( SDIO_DATA);	// SDIO data
-  GPIO_INIT( SDIO_SCK);		// SDIO clock
-  GPIO_INIT( SDIO_CMD);		// SDIO command
 
 //  Pertec initialization.
 
@@ -65,8 +60,6 @@ void InitGPIO( void)
 
 //  SetupGPIO - Routine called by GPIO_INIT Macro.
 //  ----------------------------------------------
-//
-//    
 
 static void SetupGPIO( uint32_t Gpio, uint16_t Pin, 
                       uint8_t Mode, uint8_t Pull, int Initial)
@@ -80,40 +73,6 @@ static void SetupGPIO( uint32_t Gpio, uint16_t Pin,
   return;
 } // SetupGPIO
  
-
-//  ShowBuffer - Display buffer contents.
-//  -------------------------------------
-//
-//	Mote that the third argument, if true, forces an EBCDIC display.
-//
-
-void ShowBuffer( uint8_t *Buf, int Buflen, bool Ebcdic)
-{
-
-  int
-    base,
-    i, j;
-    
-
-  for ( i = 0; i < Buflen/16; i++)
-  {
-    base = 16*i;
-    Uprintf( "%04x: ", base);
-    for ( j = 0; j < 16; j++)
-      Uprintf( "%02x ", Buf[j+base]);
-    Uprintf("  ");
-    for ( j = 0; j < 16; j++)
-    {
-      int ch = Buf[j+base];
-      
-      if ( Ebcdic)
-        ch = E2A( ch);
-      Uprintf( "%c", isprint( ch) ? ch : '.');
-    } // determine how to print
-    Uprintf( "\n");    
-  } // for each line
-
-} // ShowBuffer
 
 //  Delay Setup.
 //  ------------
@@ -174,7 +133,7 @@ void sys_tick_handler( void)
 //
 //	We interrupt every 1 msec.
 //
-  
+
 void SetupSysTick( void)
 {
 

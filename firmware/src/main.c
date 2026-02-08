@@ -10,114 +10,142 @@
 
 
 #include "license.h"
-
-
-#include "comm.h"
-
+#include "protocol.h"
+#include "hostcomm.h"
+#include "usbserial.h"
 #include "gpiodef.h"
 #include "globals.h"
-
 #include "miscsubs.h"
-
 #include "tapedriver.h"
-
+#include "tapeutil.h"
 #include "dbserial.h"
 
-// Private function prototypes
+/* Receive buffer for command payloads (small – max command payload) */
+static uint8_t CmdBuf[64];
 
-static void Init( void);
+static void Init(void);
+static void ProcessCommands(void);
 
-
-//  Main program entry.
-//  -------------------
-//
-//  Perform initialiation (see "Init" routine)
-//  then exit to command processor.
-//
-
-int main(void) 
+int main(void)
 {
+    Init();
+    ProcessCommands();   /* never returns */
+    return 0;
+}
 
-  Init();             // go do some initialization
-
-//   Uprintf( "Delay is %d\n",rcc_apb1_frequency / 4000000 - 1);
-
-  ProcessCommand();                     // never comes back
-  return 0; 
-} // main
-
-
-//* Initialization tasks.
-//  ---------------------
-//
-//	Sets things up:
-//
-//	  1)  GPIO configuration
-//	  2)  USB ACM (or UART) configuration
-//	  3)  Millisecond tick interrupt
-//	  4)  Microsecond delay timer
-//	  5)  Time of day clock
-//	  6)  SD card interface
-//	  7)  Tape interface
-//
-//	  8)  If SERIAL_DEBUG is defined, initialize UART1
-//
-//  
-
-static void Init( void) 
+static void Init(void)
 {
+    rcc_clock_setup_pll(&rcc_hse_8mhz_3v3[RCC_CLOCK_3V3_168MHZ]);
 
-//  Set system clock.
-  
- rcc_clock_setup_pll(&rcc_hse_8mhz_3v3[RCC_CLOCK_3V3_168MHZ]);
+    DBinit();
 
- DBinit();				// initialize debugger
+    Milliseconds = 0;
+    InitGPIO();
+    SetupSysTick();
+    DelaySetup();
 
-//  Set up the Systick timer for 1 msec tick.
+    HostCommInit();      /* USB CDC init + protocol layer */
 
-  Milliseconds = 0;                     // start off ticker
-  InitGPIO();				// set up primary GPIOs
-  SD_GPIO_Init();			// initialize the SD interface
-  SetupSysTick();			// get the milliscond timer going
-  DelaySetup();				// set up delay timer
+    TapeInit();
 
-  InitACM(115200);			// initialize USB comm
 
-//  Wait for console check-in.  
+    DBprintf("Tape controller v" VERSION " ready\n");
+}
 
-  Ugets( (char *) Buffer, 256);         // just clear out any input garbage
+static void ProcessCommands(void)
+{
+    uint8_t type;
+    uint32_t len;
 
-  while(1)
-  {
-    char c;
+    while (1) {
+        if (PktRecv(&type, CmdBuf, sizeof(CmdBuf), &len) != 0) {
+            SendError(ERR_INVALID, "Packet too large");
+            continue;
+        }
 
-    Uprintf( "\nPress \'G\' start\n");
- 
-    c =  Ugetchar();
-    if ( c == 'g' || c == 'G')
-      break;
-  } // wait for a go
-    
-  Uprintf("\nTape Utility version " VERSION " ready...\n"
-          "Enter \"HELP\" for a command description\n");
+        switch (type) {
 
-//  Get SDIO going.
+        case CMD_PING:
+            PktSend(RSP_PONG, NULL, 0);
+            break;
 
-  SD_Init();				// initialize SDcard.
-  MountSD( 0);				// do it twice
-  Uprintf( "SDIO initialized.\n");
-  
-//  Initialize the tape interface.
+        case CMD_STATUS:
+            HandleStatus();
+            break;
 
-  TapeInit();  
-  
-  Uprintf( "Tape I/O initialized.\n"); 
+        case CMD_INIT:
+            HandleInit();
+            break;
 
-//  Initialize the UART if serial debugging..
+        case CMD_REWIND:
+            HandleRewind();
+            break;
 
-  DBprintf( "Debug I/O ready.\n");
+        case CMD_UNLOAD:
+            HandleUnload();
+            break;
 
-  return;
-      
-} // Init
+        case CMD_READ_FWD:
+            HandleReadForward(len >= 1 ? CmdBuf[0] : 0);
+            break;
 
+        case CMD_SKIP: {
+            int16_t cnt = 1;
+            if (len >= 2)
+                cnt = (int16_t)((uint16_t)CmdBuf[0] | ((uint16_t)CmdBuf[1] << 8));
+            HandleSkip(cnt);
+            break;
+        }
+
+        case CMD_SPACE: {
+            int16_t cnt = 1;
+            if (len >= 2)
+                cnt = (int16_t)((uint16_t)CmdBuf[0] | ((uint16_t)CmdBuf[1] << 8));
+            HandleSpace(cnt);
+            break;
+        }
+
+        case CMD_SET_ADDR:
+            HandleSetAddr(len >= 1 ? CmdBuf[0] : 0);
+            break;
+
+        case CMD_SET_STOP:
+            HandleSetStop(
+                len >= 1 ? CmdBuf[0] : 2,
+                len >= 2 ? CmdBuf[1] : 0);
+            break;
+
+        case CMD_SET_RETRIES:
+            HandleSetRetries(len >= 1 ? CmdBuf[0] : 0);
+            break;
+
+        case CMD_DEBUG: {
+            uint16_t cmd = 0;
+            if (len >= 2)
+                cmd = (uint16_t)CmdBuf[0] | ((uint16_t)CmdBuf[1] << 8);
+            HandleDebug(cmd);
+            break;
+        }
+
+        case CMD_SET_1600:
+            HandleSet1600();
+            break;
+
+        case CMD_SET_6250:
+            HandleSet6250();
+            break;
+
+        case CMD_CREATE_IMG:
+            HandleCreateImage(len >= 1 ? CmdBuf[0] : 0);
+            break;
+
+        case CMD_WRITE_IMG:
+            HandleWriteImage(len >= 1 ? CmdBuf[0] : 0);
+            break;
+
+        default:
+            SendError(ERR_INVALID, "Unknown command");
+            break;
+        }
+    }
+}
