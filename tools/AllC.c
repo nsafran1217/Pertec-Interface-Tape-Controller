@@ -473,6 +473,7 @@ void usb_disconnect(void);
 #include <libopencm3/usb/cdc.h>
 #include <libopencm3/cm3/scb.h>
 #include <libopencm3/usb/dwc/otg_fs.h>
+#include <libopencm3/cm3/nvic.h>
 
 #include "dbserial.h"
 #include "usbserial.h"
@@ -482,7 +483,7 @@ void usb_disconnect(void);
 #define USB_CDC_EP_IN    0x83
 
 #define USB_PKT  64
-#define INQ_SIZE (4096 + 64)   /* input queue – large enough for protocol bursts */
+#define INQ_SIZE 32768   /* large enough to pre-buffer tape records via ISR */
 
 static char  RxBuf[65];
 static char  InQ[INQ_SIZE];
@@ -728,28 +729,42 @@ void USClear(void)
     InQOut = 0;
 }
 
+/*  USGetchar – block until a byte is available.
+ *  The ISR fills InQ via cdc_rx, so no explicit usbd_poll needed.
+ */
 int USGetchar(void)
 {
-    if (!usb_connected) USInit();
     while (InQIn == InQOut)
-        usbd_poll(udev);
+        ;                       /* ISR fills InQ in background */
     char c = InQ[InQOut++];
     if (InQOut >= INQ_SIZE) InQOut = 0;
     return (unsigned char)c;
 }
 
+/*  USCharReady – non-blocking check.  */
 int USCharReady(void)
 {
-    if (!usb_connected) USInit();
-    usbd_poll(udev);
     return (InQIn != InQOut) ? 1 : 0;
+}
+
+/*  _usb_write_pkt – write one packet, guarded against ISR reentrancy.
+ *  Spins until the endpoint accepts the data; briefly re-enables the
+ *  interrupt between attempts so the ISR can process USB events
+ *  (including TX completion that frees the FIFO).
+ */
+static void _usb_write_pkt(const uint8_t *buf, int len)
+{
+    int written;
+    do {
+        nvic_disable_irq(NVIC_OTG_FS_IRQ);
+        written = usbd_ep_write_packet(udev, USB_DATA_EP_IN, buf, len);
+        nvic_enable_irq(NVIC_OTG_FS_IRQ);
+    } while (written == 0);
 }
 
 int USWritechar(char c)
 {
-    if (!usb_connected) USInit();
-    while (usbd_ep_write_packet(udev, USB_DATA_EP_IN, (uint8_t *)&c, 1) == 0)
-        usbd_poll(udev);
+    _usb_write_pkt((const uint8_t *)&c, 1);
     return c;
 }
 
@@ -765,11 +780,9 @@ void USPuts(char *s)
 
 int USWriteBlock(uint8_t *buf, int count)
 {
-    if (!usb_connected) USInit();
     while (count > 0) {
         int pass = (count >= USB_PKT) ? USB_PKT : count;
-        while (usbd_ep_write_packet(udev, USB_DATA_EP_IN, buf, pass) == 0)
-            usbd_poll(udev);
+        _usb_write_pkt(buf, pass);
         buf   += pass;
         count -= pass;
     }
@@ -1268,8 +1281,6 @@ void HandleWriteImage(uint8_t flags)
             SendMsg("Tape write error");
             break;
         }
-
-        if (CheckAbort()) { abort = true; break; }
     }
 
     FlushRecordCount();
