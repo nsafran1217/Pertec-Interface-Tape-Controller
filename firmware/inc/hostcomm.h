@@ -19,6 +19,7 @@ void PktRecvExact(uint8_t *buf, uint32_t count);
 void SendOK(const uint8_t *data, uint32_t len);
 void SendError(uint16_t code, const char *msg);
 void SendMsg(const char *msg);
+void SendMsgF(const char *fmt, ...);
 void SendStatus(uint16_t raw, uint32_t position);
 void SendImgDone(uint32_t blocks, uint32_t files, uint32_t bytes, uint8_t aborted);
 

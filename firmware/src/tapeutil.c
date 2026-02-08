@@ -1,4 +1,3 @@
-
 /***********************************************************************
  * FILE: tapeutil.c  (rewritten for host protocol)
  ***********************************************************************/
@@ -24,6 +23,7 @@
 #include "tapedriver.h"
 #include "pertbits.h"
 #include "tap.h"
+#include "usbserial.h"
 
 /* --- local state --- */
 
@@ -285,8 +285,8 @@ void HandleCreateImage(uint8_t flags)
         }
 
         if (readStat & TSTAT_TAPEMARK) {
+            SendMsgF( "Filemark hit at %d", TapePosition);
             tapeMarkSeen++;
-            SendMsg("Tape mark");
             fileCount++;
             readCount = 0;
         } else {
@@ -294,15 +294,15 @@ void HandleCreateImage(uint8_t flags)
         }
 
         if (readStat & TSTAT_CORRERR)
-            SendMsg("Corrected error");
+            SendMsgF("At block %d, an error was auto-corrected.", TapePosition);
 
         if (readStat & TSTAT_LENGTH) {
-            SendMsg("Block too long; truncated");
+            SendMsgF("Block too long at %d; truncated and flagged.", TapePosition);
             tapeHeader |= TAP_ERROR_FLAG;
         }
 
         if (readStat & TSTAT_HARDERR) {
-            SendMsg("Uncorrected error");
+            SendMsgF("At block %d, an un-corrected error was hit.", TapePosition);
             tapeHeader |= TAP_ERROR_FLAG;
         }
 
@@ -331,7 +331,7 @@ void HandleCreateImage(uint8_t flags)
 
         if (tapeMarkSeen == StopTapemarks) {
             fileCount -= (StopTapemarks - 1);
-            SendMsg("Consecutive tape marks; ending");
+            SendMsgF("%d consecutive tape marks; ending.", StopTapemarks);
             break;
         }
     }
@@ -413,12 +413,12 @@ void HandleWriteImage(uint8_t flags)
                 }
             }
             if (corrupt) {
-                SendMsg("Image file corrupt");
+                SendMsgF("Image file corrupt at block %d.", TapePosition);
                 break;
             }
         } else {
             /* tapemark */
-            SendMsg("Tapemark");
+            SendMsgF( "Filemark hit at %d", TapePosition);
             tStatus = TapeWrite(TapeBuffer, 0);
             fileCount++;
         }

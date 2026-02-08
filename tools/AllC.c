@@ -77,6 +77,7 @@ void PktRecvExact(uint8_t *buf, uint32_t count);
 void SendOK(const uint8_t *data, uint32_t len);
 void SendError(uint16_t code, const char *msg);
 void SendMsg(const char *msg);
+void SendMsgF(const char *fmt, ...);
 void SendStatus(uint16_t raw, uint32_t position);
 void SendImgDone(uint32_t blocks, uint32_t files, uint32_t bytes, uint8_t aborted);
 
@@ -102,6 +103,7 @@ bool CheckAbort(void);
 #include <stdint.h>
 #include <stdbool.h>
 #include <string.h>
+#include <stdarg.h>
 
 #include "protocol.h"
 #include "hostcomm.h"
@@ -191,6 +193,123 @@ void SendError(uint16_t code, const char *msg)
 void SendMsg(const char *msg)
 {
     PktSend(RSP_MSG, (const uint8_t *)msg, strlen(msg));
+}
+
+/*  SendMsgF – printf-style message sender.
+ *  Supports the same format specifiers as the original Uprintf:
+ *    %d   - unsigned decimal
+ *    %x   - unsigned hex (lowercase)
+ *    %c   - single character
+ *    %s   - string
+ *  Width and leading-zero modifiers work: %04x, %8d, etc.
+ */
+
+static void MsgNumout(char *buf, int *pos, int max,
+                      unsigned num, int dig, int radix, int bwz)
+{
+    const char hex[] = "0123456789abcdef";
+    char tmp[10];
+    int i;
+
+    memset(tmp, 0, sizeof(tmp));
+    if (radix == 0 || radix > 16) return;
+
+    i = sizeof(tmp) - 2;
+    do {
+        tmp[i] = (char)(num % radix);
+        num /= radix;
+        i--;
+    } while (num);
+
+    if (dig == 0)
+        dig = sizeof(tmp) - 2 - i;
+
+    for (i = sizeof(tmp) - dig - 1; i < (int)sizeof(tmp) - 1; i++) {
+        if (*pos >= max - 1) break;
+        if (bwz && !tmp[i] && (i != (int)sizeof(tmp) - 2))
+            buf[(*pos)++] = ' ';
+        else {
+            bwz = 0;
+            buf[(*pos)++] = hex[(int)tmp[i]];
+        }
+    }
+}
+
+void SendMsgF(const char *fmt, ...)
+{
+    char buf[256];
+    int pos = 0;
+    const int max = sizeof(buf);
+    const char *p;
+    va_list ap;
+    int width, bwz, i;
+    unsigned u;
+    char *s;
+
+    va_start(ap, fmt);
+
+    for (p = fmt; *p && pos < max - 1; p++) {
+        if (*p != '%') {
+            buf[pos++] = *p;
+            continue;
+        }
+
+        ++p;
+        width = 0;
+        bwz = 1;
+
+        if (*p == '0') { p++; bwz = 0; }
+
+        while (*p >= '0' && *p <= '9')
+            width = (width * 10) + (*p++ - '0');
+
+        switch (*p) {
+        case 'd':
+            u = va_arg(ap, unsigned int);
+            MsgNumout(buf, &pos, max, u, width, 10, bwz);
+            break;
+
+        case 'x':
+            u = va_arg(ap, unsigned int);
+            MsgNumout(buf, &pos, max, u, width, 16, bwz);
+            break;
+
+        case 'c':
+            i = va_arg(ap, int);
+            if (pos < max - 1) buf[pos++] = (char)i;
+            break;
+
+        case 's':
+            s = va_arg(ap, char *);
+            if (!width) {
+                while (*s && pos < max - 1)
+                    buf[pos++] = *s++;
+            } else {
+                int slen = strlen(s);
+                i = slen - width;
+                if (i >= 0) {
+                    s += i;  /* truncate from left */
+                    while (*s && pos < max - 1)
+                        buf[pos++] = *s++;
+                } else {
+                    while (*s && pos < max - 1)
+                        buf[pos++] = *s++;
+                    for (; i && pos < max - 1; i++)
+                        buf[pos++] = ' ';
+                }
+            }
+            break;
+
+        default:
+            if (pos < max - 1) buf[pos++] = *p;
+            break;
+        }
+    }
+
+    va_end(ap);
+    buf[pos] = 0;
+
+    PktSend(RSP_MSG, (const uint8_t *)buf, pos);
 }
 
 void SendStatus(uint16_t raw, uint32_t position)
@@ -1015,15 +1134,15 @@ void HandleCreateImage(uint8_t flags)
         }
 
         if (readStat & TSTAT_CORRERR)
-            SendMsg("Corrected error");
+            SendMsgF("At block %d, an error was auto-corrected.", TapePosition);
 
         if (readStat & TSTAT_LENGTH) {
-            SendMsg("Block too long; truncated");
+            SendMsgF("Block too long at %d; truncated and flagged.", TapePosition);
             tapeHeader |= TAP_ERROR_FLAG;
         }
 
         if (readStat & TSTAT_HARDERR) {
-            SendMsg("Uncorrected error");
+            SendMsgF("At block %d, an un-corrected error was hit.", TapePosition);
             tapeHeader |= TAP_ERROR_FLAG;
         }
 
@@ -1052,7 +1171,7 @@ void HandleCreateImage(uint8_t flags)
 
         if (tapeMarkSeen == StopTapemarks) {
             fileCount -= (StopTapemarks - 1);
-            SendMsg("Consecutive tape marks; ending");
+            SendMsgF("%d consecutive tape marks; ending.", StopTapemarks);
             break;
         }
     }
@@ -1134,7 +1253,7 @@ void HandleWriteImage(uint8_t flags)
                 }
             }
             if (corrupt) {
-                SendMsg("Image file corrupt");
+                SendMsgF("Image file corrupt at block %d.", TapePosition);
                 break;
             }
         } else {
