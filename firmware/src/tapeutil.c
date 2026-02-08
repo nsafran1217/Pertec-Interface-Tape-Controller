@@ -286,6 +286,7 @@ void HandleCreateImage(uint8_t flags)
 
         if (readStat & TSTAT_TAPEMARK) {
             tapeMarkSeen++;
+            SendMsg("Tape mark");
             fileCount++;
             readCount = 0;
         } else {
@@ -417,6 +418,7 @@ void HandleWriteImage(uint8_t flags)
             }
         } else {
             /* tapemark */
+            SendMsg("Tapemark");
             tStatus = TapeWrite(TapeBuffer, 0);
             fileCount++;
         }
