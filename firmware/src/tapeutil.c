@@ -32,6 +32,7 @@
 #include "tapedriver.h"
 #include "pertbits.h"
 #include "tap.h"
+#include "remotefs.h"
 
 //  Local variables.
 

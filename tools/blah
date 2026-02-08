@@ -1,0 +1,37 @@
+I have an application that runs on an STM32 microcontroller, using libopencm3 library. Your goal is to convert the project from using a local CLI interface where the user interacts with it over a USB serial connection ACM and writes data to an SD card, to one that takes commands and reads and writes data over USB to an application running on the host. 
+
+Try to modify existing files relating to tape operations as little as possible. Do not completley rewrite tapeutil.c.
+I have already removed files relating to functions which will no longer be used. usbserial.h, usb.c, main.c, comm.c and related headers will need modified. Remove anything relating to mass storage. The MCU application will never use USGetchar or related functions. All communication will happen with the host application. 
+Feel free to remove any USprintf, USGetchar, etc. calls and functions and replace them with a different method to communicate status and output to the host. You can also setup return codes for functions calls.
+
+tapeutil.c should have its functions replicated in the host application. logic for interacting with the tape drive and assembling files should remain in tapeutil.c. f_read and f_write calls should be replaced with functions which behave very similarly. 
+
+The USB interface must be able to move 100 KB/s to the host. I dont think 115200 is fast enough. The only communication with the host will take place with the host application.
+
+Write the host side application in python. It should take the following commands:
+
+ { "STATUS",	"Show detailed tape status",	CmdShowStatus  	},  // tapeutil
+ { "REWIND",	"Rewind tape",			CmdRewindTape	},  // tapeutil
+ { "READ",    	
+   "Read tape to image <file> [N] = no rewind",	CmdCreateImage  },  // tapeutil
+
+ { "WRITE",	
+   "Write tape from <file> [N] = no rewind", 	CmdWriteImage	},  // tapeutil
+ { "DUMP",      "Read and display tape block [E] specifies EBCDIC",
+                                       	        CmdReadForward  },  // tapeutil
+ { "INIT",	"Initialize tape interace",	CmdInitTape	},  // tapeutil
+ { "ADDRESS",	
+   "Set tape drive address 0-7",		CmdSetAddr	},  // tapeutil
+ { "SKIP",	
+   "Skip n blocks (+=forward, -=backward)",	CmdSkip		},  // tapeutil
+ { "SPACE", 
+    "Space tape n files (+=forward, -=backward)", CmdSpace	},  // tapeutil
+ { "UNLOAD",	"Unload tape and go offline",	CmdUnloadTape   },  // tapeutil
+ { "STOP",	
+   "Set stop: # of filemarks or V for EOV ", 	CmdSetStop	},  // tapeutil
+ { "DEBUG",	"Set command register [value]",	CmdTapeDebug	},  // tapeutil
+
+Provide a flag for READ and WRITE commands for no rewind.
+
+
+Files are located in this project. Modify the files in the project directly.

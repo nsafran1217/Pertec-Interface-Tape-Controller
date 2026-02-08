@@ -9,6 +9,7 @@
 
 #include "comm.h"
 #include "usbserial.h"
+#include "tapeutil.h"
 
 static void Numout( unsigned Num, int Dig, int Radix, int bwz);
 
@@ -211,6 +212,78 @@ char *Ugets( char *Buf, int Len)
   USPuts( "\r\n");		// end with a newline
   return Buf;
 } // Ugets
+
+
+//  ProcessCommand - receive commands from host and dispatch to tape utilities.
+//  Expected input: a single-line command with arguments separated by spaces.
+//  Examples: "READ image.bin N" or "STATUS"
+
+void ProcessCommand(void)
+{
+  char line[256];
+  char *argv[8];
+  int argc;
+  int pos;
+
+  for (;;) {
+    // read a line
+    pos = 0;
+    while (pos < (int)sizeof(line)-1) {
+      int c = USGetchar();
+      if (c == '\r') continue;
+      if (c == '\n') break;
+      line[pos++] = (char)c;
+    }
+    line[pos] = '\0';
+    if (pos == 0) continue;
+
+    // tokenize by spaces
+    argc = 0;
+    char *p = line;
+    while (*p && argc < (int)(sizeof(argv)/sizeof(argv[0]))) {
+      while (*p == ' ') p++;
+      if (!*p) break;
+      argv[argc++] = p;
+      while (*p && *p != ' ') p++;
+      if (*p) *p++ = '\0';
+    }
+    if (argc == 0) continue;
+
+    // uppercase command
+    for (char *pc = argv[0]; *pc; ++pc) *pc = (char) toupper((int)*pc);
+
+    // Dispatch
+    if (strcmp(argv[0], "STATUS") == 0) {
+      CmdShowStatus(NULL);
+    } else if (strcmp(argv[0], "REWIND") == 0) {
+      CmdRewindTape(NULL);
+    } else if (strcmp(argv[0], "READ") == 0) {
+      CmdCreateImage(&argv[1]);
+    } else if (strcmp(argv[0], "WRITE") == 0) {
+      CmdWriteImage(&argv[1]);
+    } else if (strcmp(argv[0], "DUMP") == 0) {
+      CmdReadForward(&argv[1]);
+    } else if (strcmp(argv[0], "INIT") == 0) {
+      CmdInitTape(NULL);
+    } else if (strcmp(argv[0], "ADDRESS") == 0) {
+      CmdSetAddr(&argv[1]);
+    } else if (strcmp(argv[0], "SKIP") == 0) {
+      CmdSkip(&argv[1]);
+    } else if (strcmp(argv[0], "SPACE") == 0) {
+      CmdSpace(&argv[1]);
+    } else if (strcmp(argv[0], "UNLOAD") == 0) {
+      CmdUnloadTape(&argv[1]);
+    } else if (strcmp(argv[0], "STOP") == 0) {
+      CmdSetStop(&argv[1]);
+    } else if (strcmp(argv[0], "DEBUG") == 0) {
+      CmdTapeDebug(&argv[1]);
+    } else if (strcmp(argv[0], "HELP") == 0) {
+      Uprintf("Available: STATUS REWIND READ WRITE DUMP INIT ADDRESS SKIP SPACE UNLOAD STOP DEBUG\n");
+    } else {
+      Uprintf("Unknown command\n");
+    }
+  }
+}
 
 
 //  Numout - Output a number in any radix.

@@ -77,35 +77,12 @@ static void Init( void)
 
   Milliseconds = 0;                     // start off ticker
   InitGPIO();				// set up primary GPIOs
-  SD_GPIO_Init();			// initialize the SD interface
   SetupSysTick();			// get the milliscond timer going
   DelaySetup();				// set up delay timer
 
-  InitACM(115200);			// initialize USB comm
+  InitACM(115200);		// initialize USB comm (host app will manage higher throughput)
 
-//  Wait for console check-in.  
-
-  Ugets( (char *) Buffer, 256);         // just clear out any input garbage
-
-  while(1)
-  {
-    char c;
-
-    Uprintf( "\nPress \'G\' start\n");
- 
-    c =  Ugetchar();
-    if ( c == 'g' || c == 'G')
-      break;
-  } // wait for a go
-    
-  Uprintf("\nTape Utility version " VERSION " ready...\n"
-          "Enter \"HELP\" for a command description\n");
-
-//  Get SDIO going.
-
-  SD_Init();				// initialize SDcard.
-  MountSD( 0);				// do it twice
-  Uprintf( "SDIO initialized.\n");
+  Uprintf("\nTape Utility version " VERSION " ready...\n");
   
 //  Initialize the tape interface.
 

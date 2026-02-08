@@ -211,23 +211,6 @@ static const struct usb_interface_descriptor data_iface[] =
   }
 };
 
-static const struct usb_interface_descriptor msc_iface[] = 
-{
-  {
-    .bLength = USB_DT_INTERFACE_SIZE,
-    .bDescriptorType = USB_DT_INTERFACE,
-    .bInterfaceNumber = INTERFACE_NO_2,
-    .bAlternateSetting = 0,
-    .bNumEndpoints = 2,
-    .bInterfaceClass = USB_CLASS_MSC,
-    .bInterfaceSubClass = USB_MSC_SUBCLASS_SCSI,
-    .bInterfaceProtocol = USB_MSC_PROTOCOL_BBB,
-    .iInterface = 0,
-
-    .endpoint = msc_endp,
-  }
-};
-
 static const struct usb_interface ifaces[] = 
 {
   {
@@ -238,10 +221,6 @@ static const struct usb_interface ifaces[] =
     .num_altsetting = 1,
     .altsetting = data_iface,
   },
-  {
-    .num_altsetting = 1,
-    .altsetting = msc_iface,
-  },
 };
 
 static const struct usb_config_descriptor config_descr = 
@@ -249,7 +228,7 @@ static const struct usb_config_descriptor config_descr =
   .bLength = USB_DT_CONFIGURATION_SIZE,
   .bDescriptorType = USB_DT_CONFIGURATION,
   .wTotalLength = 0,
-  .bNumInterfaces = 3,
+  .bNumInterfaces = 2,
   .bConfigurationValue = 1,
   .iConfiguration = 0,
   .bmAttributes = 0x80,
@@ -377,50 +356,7 @@ static void usb_suspend_callback()
   }
 } // usb_suspend
 
-//*	Mass storage routines.
-//	----------------------
-//	
-//	All refer to routines in dskio.c
-//
-
-static uint32_t get_block_count(void) 
-{
-  DBprintf( "Get block count returns %d\n", SD_GetCardSize());
-
-    return SD_GetCardSize();
-} // get_block_count
-
-//*	Read an SD block.
-//	-----------------
-//
-//	Called from the MSC driver
-//
-
-static int read_block(uint32_t lba, uint8_t *copy_to) 
-{
-
-  int stat;
-
-  stat = SD_ReadBlocks( copy_to, lba, 1);
-  SD_WaitComplete();
-  return stat;
-} // read_block
-
-//*	Write an SD block
-//	-----------------
-//
-//	Called from the MSC driver
-//	
-
-static int write_block(uint32_t lba, const uint8_t *copy_from) 
-{
-
-  int stat;
-
-  stat = SD_WriteBlocks( (void *) copy_from, lba, 1);
-  SD_WaitComplete();
-  return stat;
-} // write_block
+/* Mass-storage/SD card block access removed. Host-based file IO will be used instead. */
 
 
 //  USInit - Initialize USB interface.
@@ -457,24 +393,7 @@ int USInit(void)
   usbd_register_set_config_callback(usb_device, usb_cdc_set_config_callback);
   usbd_register_suspend_callback(usb_device, usb_suspend_callback);
 
-  if (!SD_GetCardSize())
-  {
-    DBprintf( "Initializing SD I/O\n");
-    SD_Init();				// if SD not initialized
-    DBprintf( "SD init returns\n");
-  }
-
-  usb_msc_init(usb_device,
-               USB_MSC_ENDPOINT_IN,
-               USB_PACKET_SIZE,
-               USB_MSC_ENDPOINT_OUT,
-               USB_PACKET_SIZE,
-               "Sydex",
-               "SD Card",
-               "0.01",
-               get_block_count(),
-               read_block,
-               write_block);
+  /* SD card and MSC are not initialized - host will provide file IO. */
 
 
   return 0;               
