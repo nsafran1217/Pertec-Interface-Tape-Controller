@@ -65,7 +65,7 @@ int DBinit( void)
   usart_set_flow_control(UART_PORT, USART_FLOWCONTROL_NONE);
   usart_enable( UART_PORT);
 
-  DBInitialized = true;
+  DBinitialized = true;
   
   return 0;
 } // DBinit
