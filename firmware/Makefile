@@ -6,7 +6,7 @@
 
 GCC_PREFIX=arm-none-eabi
 GCC_SIZE=arm-none-eabi-size
-OCM3DIR="../libopencm3-master"
+OCM3DIR="../../libopencm3-master"
 MCU=stm32-f407
 LDIR=$(OCM3DIR)/lib
 
@@ -18,10 +18,8 @@ INCDIR:=./inc
 BINDIR:=./bin
 
 #   Files.
-
-SRCS:= main.c cli.c dbserial.c sdiosubs.c uart.c usb.c \
- comm.c diskio.c ffunicode.c miscsubs.c tapedriver.c \
- crc16.c ff.c filesub.c rtcsubs.c tapeutil.c ymodem.c
+SRCS:= main.c dbserial.c usb.c hostcomm.c \
+ miscsubs.c tapedriver.c tapeutil.c
 
 OBJS:= $(addprefix $(OBJDIR)/,$(SRCS:.c=.o)) 
 SRCS:= $(addprefix $(SRCDIR)/,$(SRCS))
