@@ -6,6 +6,18 @@ The directories are as follows:
 	firmware - Controller firmware
 	kicad - KiCAD schematics, board layout, etc.
 
+## 2026 Updates
+The main branch in this fork contains:  
+1. a fix for an off by one error when writing .tap files to a tape
+2. A platform.io config file to enable building with platform.io in vscode. The make file should still work
+
+### Problems reading tapes with large blocks
+When using this, I found that I could not reliably read tapes which had block sizes over 4k because the SD card writes were too slow.  
+The HostUSBOnly branch resolves this by completley changing the controller to use an application running on a host computer to read and write the data. More info is contained in the branches readme.  
+[https://github.com/nsafran1217/Pertec-Interface-Tape-Controller/tree/HostUSBOnly](https://github.com/nsafran1217/Pertec-Interface-Tape-Controller/tree/HostUSBOnly)
+
+
+
 The firmware can be built from source using the gcc-arm-none-eabi compiler
 and the libopencm3 development library (libopencm3.org) which is covered by
 the GNU General Public License v3.0, as is this project.
