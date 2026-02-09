@@ -265,7 +265,7 @@ void HandleCreateImage(uint8_t flags)
     while (true) {
         unsigned int readStat;
         int readCount;
-        DBprintf("%d\n", TapePosition);
+        //DBprintf("%d\n", TapePosition);
         if ((abort = CheckAbort()))
             break;
 
